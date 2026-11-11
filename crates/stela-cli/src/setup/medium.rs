@@ -160,7 +160,7 @@ impl Medium {
 
 /// `stela/install/<build>` on `volume`.
 pub(super) fn directory(volume: &Path, build: &str) -> PathBuf {
-    volume.join(install_directory(build))
+    super::join_slashed(volume, &install_directory(build))
 }
 
 /// The USB's FAT32 data partition, which holds the boot bundles, the install

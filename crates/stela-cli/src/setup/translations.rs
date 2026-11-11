@@ -80,7 +80,7 @@ pub(super) struct Store {
 
 impl Store {
     pub(super) fn directory(&self) -> PathBuf {
-        self.volume.join(DIRECTORY)
+        super::join_slashed(&self.volume, DIRECTORY)
     }
 
     fn config_text(&self) -> String {

@@ -31,13 +31,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            skip: ""
           - os: windows-2025
-            # The repaired record spells stela/boot with a / where setup wrote
-            # a \, so these two compare unequal on Windows until that is fixed.
-            skip: >-
-              --skip repair_recovers_interrupted_bundle_rename
-              --skip repair_restores_recorded_state
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -77,4 +71,4 @@ jobs:
         run: cargo clippy --locked -p stela-cli --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked -p stela-cli --lib -- ${{ matrix.skip }}
+        run: cargo test --locked -p stela-cli --lib

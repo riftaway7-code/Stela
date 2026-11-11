@@ -102,6 +102,13 @@ use stela_formats::builds;
 use stela_loader::mount_interface::{self, Interface};
 use uninstall::uninstall;
 
+/// `relative`, spelled with `/`, below `base` with the host's own separators.
+fn join_slashed(base: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 /// The Mac models setup presents, with their names: the M2 Mac mini, the
 /// board the engine is tested on. Other Macs stay listed in the wizard,
 /// greyed out, and are refused by name.

@@ -193,7 +193,7 @@ pub(super) const BOOT_DIRECTORY: &str = "stela/boot";
 
 /// `stela/boot/<build>` on `volume`.
 pub(super) fn build_directory(volume: &Path, build: &str) -> PathBuf {
-    volume.join(BOOT_DIRECTORY).join(build)
+    super::join_slashed(volume, BOOT_DIRECTORY).join(build)
 }
 
 pub(super) fn directory_of(volume: &Path, identity: Identity<'_>) -> PathBuf {
