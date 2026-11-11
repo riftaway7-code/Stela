@@ -103,7 +103,11 @@ pub(crate) fn explain(error: &reqwest::Error) -> String {
         )
     } else if error.is_timeout() {
         Some("the server did not answer in time: check the network connection, or try again later")
-    } else if lower.contains("connection refused") || lower.contains("network is unreachable") {
+    } else if lower.contains("connection refused")
+        || lower.contains("actively refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("unreachable network")
+    {
         Some("this computer cannot reach the server: check its network connection and proxy")
     } else {
         None
