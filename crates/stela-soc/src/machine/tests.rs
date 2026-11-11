@@ -1995,6 +1995,45 @@ fn smc_places_a_running_wrapper_its_shared_page_and_watchdog() {
 }
 
 #[test]
+fn the_kept_rtc_anchor_is_the_pmu_upcount_at_the_latest_board_entry() {
+    let hz = crate::counter::FREQUENCY_HZ;
+    let wall = stela_soc_data::pmu::WallClock {
+        unix_seconds: 1_792_000_000,
+        counter: 100,
+    };
+    let loaded = pmu::RtcAnchor {
+        ticks: 77 * pmu::RTC_HZ,
+        unix_seconds: Some(wall.unix_seconds - 60),
+    };
+    let epoch = pmu::RtcEpoch::anchored(100, Some(wall), Some(loaded));
+    assert_eq!(epoch.ticks, 137 * pmu::RTC_HZ);
+    let mut devices = AppleDevices::new();
+    devices.pmu_clocks.push(pmu::RtcClock::new(epoch).unwrap());
+    // No origin kept, or no board entry yet: nothing to keep.
+    assert_eq!(devices.rtc_anchor(), None);
+    devices.keep_rtc_origin(Some(wall), Some(loaded));
+    assert_eq!(devices.rtc_anchor(), None);
+    devices.observe_time(100 + 5 * hz, "test");
+    assert_eq!(
+        devices.rtc_anchor(),
+        Some(pmu::RtcAnchor {
+            ticks: 142 * pmu::RTC_HZ,
+            unix_seconds: Some(wall.unix_seconds + 5),
+        })
+    );
+    // The next boot, 100 s later on the host's clock, continues from it.
+    let next = pmu::RtcEpoch::anchored(
+        0,
+        Some(stela_soc_data::pmu::WallClock {
+            unix_seconds: wall.unix_seconds + 105,
+            counter: 0,
+        }),
+        devices.rtc_anchor(),
+    );
+    assert_eq!(next.ticks, 242 * pmu::RTC_HZ);
+}
+
+#[test]
 fn rtc_publication_precedes_every_timed_service_and_refuses_stale_effects() {
     let epoch = pmu::RtcEpoch {
         counter: 100,

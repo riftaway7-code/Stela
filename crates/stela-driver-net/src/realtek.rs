@@ -739,8 +739,28 @@ impl Link for Realtek {
         self.signalled
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        self.receive_frame(<[u8]>::to_vec)
+    }
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.receive_frame(|bytes| {
+            frame.clear();
+            frame.extend_from_slice(bytes);
+        })
+        .map(|received| received.is_some())
+    }
+}
+
+impl Realtek {
+    /// The next good frame in the receive ring, passed to `take` while its
+    /// buffer is still held.
+    fn receive_frame<T>(
+        &mut self,
+        mut take: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>, LinkError> {
         self.update_link()?;
-        let frame = self.receive.receive();
+        let frame = self.receive.receive_with(&mut take);
         if frame.is_some() || !self.signalled {
             return Ok(frame);
         }
@@ -752,7 +772,7 @@ impl Link for Realtek {
             self.link.last_phy_poll = None;
             self.update_link()?;
         }
-        Ok(self.receive.receive())
+        Ok(self.receive.receive_with(take))
     }
 }
 

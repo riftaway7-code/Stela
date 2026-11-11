@@ -24,7 +24,7 @@ use stela_drivers::block::{BlockDevice, BlockError, Submission};
 use stela_runtime::pc::boot_log::{PENDING_BYTES, Pending, Unkept, Writer};
 
 mod terminal;
-pub(crate) use terminal::{panic, print_stack_at};
+pub(crate) use terminal::{Callers, panic, print_stack_at};
 
 /// One engine-wide value. The mount runs on one processor and its handlers
 /// only print; every access is a `try_borrow`, so output that arrives while

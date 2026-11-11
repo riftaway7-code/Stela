@@ -273,6 +273,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
+        self.mirrors.monitor =
+            u64::from(self.cpu.monitor.is_some() || self.cpu.has_canonical_memory());
         self.mirrors.transition(self.mirror_state());
         self.mirrors.enter(self.cpu.pstate);
         self.cpu.state.pan = u64::from(self.cpu.pstate.pan);

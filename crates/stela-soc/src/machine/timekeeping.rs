@@ -12,6 +12,26 @@ impl AppleDevices {
         Ok(())
     }
 
+    /// Keep what this boot's PMU upcounts started from: the host's wall
+    /// time and the machine state's anchor ([`pmu::RtcEpoch::anchored`]).
+    pub fn keep_rtc_origin(
+        &mut self,
+        wall: Option<stela_soc_data::pmu::WallClock>,
+        anchor: Option<pmu::RtcAnchor>,
+    ) {
+        self.rtc_origin = Some((wall, anchor));
+    }
+
+    /// The anchor for the machine state to keep now: the first PMU's upcount
+    /// at the latest count a board entry was given. `None` without a PMU
+    /// oscillator or kept origin, or before the first entry.
+    pub fn rtc_anchor(&self) -> Option<pmu::RtcAnchor> {
+        let (wall, loaded) = self.rtc_origin?;
+        let now = self.time_seen.get().0;
+        let ticks = self.pmu_clocks.first()?.ticks_at(now)?;
+        Some(pmu::RtcAnchor::at(now, ticks, wall, loaded))
+    }
+
     /// Record the count board entry `entry` was given.
     pub(super) fn observe_time(&self, now: u64, entry: &'static str) {
         let seen = self.time_seen.get();

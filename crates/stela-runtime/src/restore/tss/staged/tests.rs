@@ -364,3 +364,53 @@ fn a_cryptex_udid_is_the_chip_and_ecid() {
         [0, 0, 0, 0, 0, 0, 0x81, 0x12, 1, 2, 3, 4, 5, 6, 7, 8]
     );
 }
+
+#[test]
+fn the_dry_run_accepts_the_staged_set_and_refuses_any_drift() {
+    use crate::restore::ticket::tests::bound_ticket;
+    let store = crate::restore::store::tests::fixture(b"x", false);
+    let restore = store.identity().clone();
+    let ap_ticket = bound_ticket(b"krnl", b"k", Some(ECID), Some(&nonces()));
+    let policy_nonce = [0x3c; 32];
+    let setup = Setup {
+        restore: &restore,
+        installed: &restore,
+        ecid: ECID,
+        ap_ticket: &ap_ticket,
+        policy_nonce: &policy_nonce,
+    };
+    let posts = Rc::new(Cell::new(0));
+    let set = setup.stage(&mut Apple { posts }).unwrap();
+    assert_eq!(set.check(&setup), Ok(()));
+
+    // Another policy nonce on the SEP side.
+    let other_nonce = [0x3d; 32];
+    let drift = Setup {
+        policy_nonce: &other_nonce,
+        ..setup
+    };
+    assert_eq!(set.check(&drift).unwrap_err().0, Kind::RecoveryPolicy);
+    // Another machine: its requests have no stored answer.
+    let other_ticket = bound_ticket(b"krnl", b"k", Some(ECID + 1), Some(&nonces()));
+    let drift = Setup {
+        ecid: ECID + 1,
+        ap_ticket: &other_ticket,
+        ..setup
+    };
+    assert_eq!(set.check(&drift).unwrap_err().0, Kind::RecoveryRoot);
+    // Another AP ticket with the same nonces changes the policy digest.
+    let other_ticket = bound_ticket(b"krnl", b"j", Some(ECID), Some(&nonces()));
+    let drift = Setup {
+        ap_ticket: &other_ticket,
+        ..setup
+    };
+    assert_eq!(set.check(&drift).unwrap_err().0, Kind::RecoveryPolicy);
+    // A damaged answer in a file that still decodes.
+    let text = String::from_utf8(set.encode().unwrap()).unwrap();
+    let damaged = Set::decode(text.replacen("<data>", "<data>AAAA", 1).as_bytes()).unwrap();
+    assert!(damaged.check(&setup).is_err());
+    // A set without the nonce cannot match the policy request.
+    let mut bare = set.clone();
+    bare.policy_nonce = None;
+    assert_eq!(bare.check(&setup).unwrap_err().0, Kind::RecoveryPolicy);
+}

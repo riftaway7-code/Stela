@@ -951,10 +951,14 @@ impl Ans {
             self.completed.remove(index);
             self.update_irq(port.access);
         }
+        // Discards still queued for a pause in transfers go to the disk
+        // before the shutdown completes: its flush does not send them, and
+        // the guest was told their blocks read as deallocated.
         if self.shutdown
             && self.pending.is_empty()
             && self.inflight.is_empty()
             && self.completed.is_empty()
+            && !self.medium.device.discarding()
         {
             self.medium.device.flush().map_err(|_| {
                 refuse(

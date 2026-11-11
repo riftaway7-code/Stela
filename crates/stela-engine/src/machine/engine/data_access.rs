@@ -183,11 +183,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // per retry, and every retry repeats the call's work.
         if refused.is_some() {
             let current = self.cpu.tlbi_current();
-            self.tlb_maintained(
-                mmu::tlbi::Reach::All,
-                mmu::tlbi::Everywhere::NonGlobal,
-                current.asid,
-            );
+            // A regime without ASIDs gives up everything.
+            let everywhere = current
+                .asid
+                .map_or(mmu::tlbi::Everywhere::All, mmu::tlbi::Everywhere::NonGlobal);
+            self.tlb_maintained(mmu::tlbi::Reach::All, everywhere, current.asid);
         }
     }
 

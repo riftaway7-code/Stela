@@ -198,11 +198,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // To EL1, or to EL2 from EL2 and from EL0 in the host.
             ExceptionOperation::SupervisorCall { immediate } => {
                 self.advance_step();
+                self.note_transition_miss(transition::SUPERVISOR_CALL);
+                let start = self.transition_start();
                 self.take(Exception::synchronous(
                     Class::SupervisorCall,
                     u32::from(immediate),
                     pc + INSTRUCTION,
                 ));
+                self.note_transition(transition::SUPERVISOR_CALL, start, 0, 0);
                 Ok(())
             }
             // BRK: to EL2 from EL2, or under HCR_EL2.TGE or MDCR_EL2.TDE
@@ -325,6 +328,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         self.guest_entry(self.cpu.exception_state(), self.cpu.pstate.guarded);
         let trace = self.monitor_before(MonitorKind::ExceptionReturn);
+        if key.is_none() {
+            self.note_transition_miss(transition::EXCEPTION_RETURN);
+        }
+        let start = self.transition_start();
+        let spsr = self.cpu.exception_state();
         self.cpu.exception_return(target).map_err(|_| {
             self.unsupported(RequirementKind::Native(
                 "canonical exclusive/event settlement failed before exception return",
@@ -338,6 +346,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         });
         self.monitor_after(trace);
         self.transitioned();
+        if key.is_none() {
+            self.note_transition(transition::EXCEPTION_RETURN, start, spsr, 0);
+        }
         Ok(())
     }
 
@@ -382,6 +393,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         if let Some(index) = written(access) {
             return self.stored_write(word, access, index);
+        }
+        if access.encoding() == TABLE_BASE && access.direction() == Direction::Write {
+            return self.table_base_write(word, access);
         }
         if let Some(index) = guarded_written(access) {
             return self.guarded_access(word, access, index);
@@ -530,24 +544,63 @@ impl<H: Host, D: Devices> Machine<H, D> {
         step
     }
 
+    /// MSR TTBR0_EL1: one that only reaches the register's storage opens
+    /// [`TABLE_BASE_KEPT`] there, for a register that takes what the
+    /// thunk's fixed bits say, so a later write of the same value completes
+    /// natively. A write of another value changes translation and stays the
+    /// engine's.
+    fn table_base_write(&mut self, word: u32, access: RegisterAccess) -> Step {
+        let before = self.completion_point();
+        self.plain_read = None;
+        let step = self.register_access(word, access);
+        let value = self
+            .plain_read
+            .filter(|&(register, _)| {
+                matches!(
+                    register,
+                    SystemRegister::TTBR0_EL1 | SystemRegister::TTBR0_EL2
+                ) && self.register_fixed_bits(register)
+                    == self.register_fixed_bits(SystemRegister::TTBR0_EL1)
+            })
+            .and_then(|(register, index)| self.cpu.registers.address(register, index));
+        if let (Ok(()), true, Some(value)) = (&step, self.position() == before, value) {
+            self.mirrors[TABLE_BASE_KEPT] = register_read::Cell { readable: 1, value };
+        }
+        step
+    }
+
     /// MSR SPRR_PERM_EL0. Like every SPRR_PERM write it closes the
     /// register's cells, but a cell open before it reopens with what a read
     /// now returns: the write changes neither the controls the read's
     /// plainness follows from (SPRR_CONFIG_EL1, HACR_EL2, HCR_EL2 and the
     /// EL) nor which SPRR_PERM register it reads, so dyld's read-back after
-    /// each toggle completes natively.
+    /// each toggle completes natively. That holds in every state whose read
+    /// names the register this write reached ([`user_permission_register`]):
+    /// a kernel writes it at EL2 at each thread switch and reads it back in
+    /// other states of the host, whose cells then stay open too.
     pub(super) fn permission_write(&mut self, word: u32, access: RegisterAccess) -> Step {
-        let open = self.mirrors[SPRR_PERM_MIRROR].readable != 0;
+        let cells = self.mirrors.banks.map(|cells| cells[SPRR_PERM_MIRROR]);
+        let tge = self.cpu.in_host();
+        let current = self.mirror_state();
+        let reached = user_permission_register(current, tge);
+        let reopen: Vec<usize> = (0..MIRROR_STATES)
+            .filter(|&state| {
+                cells[state].readable != 0 && user_permission_register(state, tge) == reached
+            })
+            .collect();
         let before = self.completion_point();
         let step = self.register_access(word, access);
-        if step.is_err() || !open || self.position() != before {
+        if step.is_err() || reopen.is_empty() || self.position() != before {
             return step;
         }
         let read = decode_register(word | MRS_READ).expect("MSR has an MRS form");
         let physical = self.now();
         if let RegisterOutcome::Read(value) = self.cpu.apple_access(read, physical) {
             let value = self.degraded_read(read, value);
-            self.mirrors[SPRR_PERM_MIRROR] = register_read::Cell { readable: 1, value };
+            for state in reopen {
+                self.mirrors.banks[state][SPRR_PERM_MIRROR] =
+                    register_read::Cell { readable: 1, value };
+            }
         }
         step
     }
@@ -807,7 +860,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.device_lines = None;
                 }
                 // PSTATE.D and Apple registers can change what is derived.
-                if changes.reads_kept {
+                if changes.reads_kept && changes.pointer {
+                    self.forget_pointer_derived();
+                } else if changes.reads_kept {
                     self.forget_derived();
                 } else if !changes.stored && !changes.permissions {
                     self.derived_changed();
@@ -1026,6 +1081,19 @@ fn data_barrier() {
     #[cfg(test)]
     tests::DATA_BARRIERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether an SPRR_PERM_EL0 read in mirror state `state` names the EL2&0
+/// regime's EL0 permissions (`cpu::PERM_EL0_20`), as at EL2 and at EL0 under
+/// HCR_EL2.TGE, rather than the EL1&0 regime's (`Cpu::regime`,
+/// `Cpu::apple_el0`). HCR_EL2 writes close every cell, so the TGE a write
+/// finds is that of every open cell.
+fn user_permission_register(state: usize, tge: bool) -> bool {
+    match state & 3 {
+        2 => true,
+        0 => tge,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

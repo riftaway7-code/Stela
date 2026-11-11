@@ -192,6 +192,9 @@ pub(super) struct Code {
     /// The fetch pages its PEs compile with the two-sided range check at
     /// EL0.
     pub(super) two_sided: super::page_sets::PageSet,
+    /// Proven entries of blocks compiled at more than one address
+    /// ([`super::rebase`]).
+    pub(super) rebases: super::rebase::Rebases,
 }
 
 /// A part's blocks being taken away page by page, in steps of bounded
@@ -518,6 +521,9 @@ pub struct CodeReport {
     pub generations: [u32; 2],
     pub promoted: u64,
     pub outs: [u64; 4],
+    /// Installs relocated from an entry proven during the boot, entries
+    /// proven and refused, and the bytes kept ([`super::rebase`]).
+    pub rebases: super::RebaseCounts,
 }
 
 /// What [`CodeReport::targets`] counts.
@@ -647,6 +653,7 @@ impl Code {
             step_visits: super::code_cache::STEP_VISITS,
             tagged: Default::default(),
             two_sided: Default::default(),
+            rebases: super::rebase::Rebases::new(super::rebase::BOUND),
         }
     }
 
@@ -754,6 +761,7 @@ impl Code {
                 .arena
                 .as_ref()
                 .map_or([0; 4], |arena| arena.ring.outs()),
+            rebases: self.rebases.counts(),
         }
     }
 

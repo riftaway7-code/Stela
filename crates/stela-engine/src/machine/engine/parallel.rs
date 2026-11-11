@@ -318,7 +318,7 @@ pub struct Counts {
     pub loops: [u64; 3],
     /// Its installs at EL0 and above by where the block came from
     /// ([`super::Statistics::store_sources`]).
-    pub store_sources: [[u64; 4]; 2],
+    pub store_sources: [[u64; 5]; 2],
     /// Blocks it holds, the slots its block table has, the pages its
     /// index finds blocks in, and the parts of its code arena it released
     /// for heap pressure.
@@ -344,6 +344,10 @@ pub struct Counts {
     /// on other PEs ([`super::Statistics::sync_ticks`]), and its waits.
     pub sleep_ticks: u64,
     pub spin_ticks: u64,
+    /// Of `sleep_ticks`, those in the host halt ([`super::Statistics::halt_ticks`]).
+    pub halt_ticks: u64,
+    /// Of `waits`, WFEs completed in their exit ([`super::Statistics::short_waits`]).
+    pub short_waits: u64,
     pub sync_ticks: u64,
     pub waits: u64,
     pub broadcasts: u64,
@@ -364,17 +368,19 @@ pub struct Counts {
     pub lookup_forgets: [u64; 4],
     /// Its ITLB's fills, drops and forgotten contexts by where they came
     /// from ([`super::Statistics::itlb_sources`]).
-    /// GENTER completed natively and by the engine, then GEXIT's
-    /// ([`super::Statistics::native_transitions`]).
-    pub transitions: [u64; 4],
-    /// Why GENTER, then GEXIT, took the engine path
+    /// GENTER completed natively and by the engine, then GEXIT's, SVC's
+    /// and ERET's ([`super::Statistics::native_transitions`]).
+    pub transitions: [u64; 8],
+    /// Why SVC, ERET, GENTER and GEXIT took the engine path, in kind order
     /// ([`super::Statistics::transition_misses`]).
-    pub transition_misses: [u64; 2 * super::transitions::miss::REASONS],
+    pub transition_misses: [u64; 4 * super::transitions::miss::REASONS],
     pub itlb_sources: [u64; 12],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail.
     pub stamped: [u64; chain::STAMP_COUNTS + 3],
+    /// PAC results its service computed since boot, each a memo miss.
+    pub pac_fills: u64,
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
     /// step timing is enabled.
     pub phases: [u64; step_timing::Phase::COUNT],
@@ -768,8 +774,22 @@ impl Hub {
     /// interrupted nor waited for: nothing it can use is stale, and the
     /// mail left first is read before it uses that context, which it
     /// publishes first ([`Machine::publish_translating`]).
+    #[cfg(test)]
     pub(super) fn broadcast(&self, from: usize, maintenance: &[Maintenance]) -> Vec<(usize, u64)> {
         let mut posted = Vec::new();
+        self.broadcast_each(from, maintenance, |pe, serial| posted.push((pe, serial)));
+        posted
+    }
+
+    /// [`Self::broadcast`], giving each PE to wait for and its serial to
+    /// `reached` instead of collecting them; how many there were.
+    pub(super) fn broadcast_each(
+        &self,
+        from: usize,
+        maintenance: &[Maintenance],
+        mut reached: impl FnMut(usize, u64),
+    ) -> usize {
+        let mut posted = 0;
         for pe in self.others(from) {
             let inbox = &self.inboxes[pe];
             let mut serial = 0;
@@ -789,7 +809,8 @@ impl Hub {
             });
             if reaches {
                 self.interrupt(pe);
-                posted.push((pe, serial));
+                reached(pe, serial);
+                posted += 1;
             }
         }
         posted
@@ -846,15 +867,25 @@ impl Hub {
     /// PE `pe`'s mail, if any, which its machine applies and then
     /// acknowledges with [`Self::acknowledge`].
     pub(super) fn take(&self, pe: usize) -> Option<Mail> {
+        self.take_into(pe, &mut Vec::new())
+    }
+
+    /// [`Self::take`], leaving the emptied buffer `spare` in the inbox for
+    /// the next mail, so a read and the next post allocate nothing.
+    pub(super) fn take_into(&self, pe: usize, spare: &mut Vec<Maintenance>) -> Option<Mail> {
         let inbox = &self.inboxes[pe];
         if !inbox.pending.swap(false, Ordering::AcqRel) {
             return None;
         }
+        spare.clear();
         let mut mail = inbox.mail.lock().unwrap_or_else(|e| e.into_inner());
-        let serial = mail.serial;
-        let taken = core::mem::take(&mut *mail);
-        mail.serial = serial;
-        Some(taken)
+        Some(Mail {
+            start: mail.start.take(),
+            event: core::mem::take(&mut mail.event),
+            maintenance: core::mem::replace(&mut mail.maintenance, core::mem::take(spare)),
+            serial: mail.serial,
+            merged: core::mem::take(&mut mail.merged),
+        })
     }
 
     pub(super) fn acknowledge(&self, pe: usize, serial: u64) {
@@ -1454,7 +1485,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if !hub.pending(self.current) {
                 return Ok(());
             }
-            let Some(mail) = hub.take(self.current) else {
+            let mut spare = core::mem::take(&mut self.mail_spare);
+            let Some(mail) = hub.take_into(self.current, &mut spare) else {
+                self.mail_spare = spare;
                 return Ok(());
             };
             if mail.event && !self.waiting.is_some_and(|wait| wait.down) {
@@ -1465,6 +1498,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.maintain(*maintenance)?;
             }
             hub.acknowledge(self.current, mail.serial);
+            self.mail_spare = mail.maintenance;
             if let Some(address) = mail.start {
                 self.start(Start {
                     cpu: self.current,
@@ -1596,6 +1630,120 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
     }
 
+    /// Complete a short WFE inside the scheduler's entry, without its wait
+    /// passes: `Some` with the completion when the running PE, not the home
+    /// PE and the only one of its machine, waits in WFE (no monitor armed,
+    /// not powered down) and becomes ready ([`Self::ready`], the passes'
+    /// own test) by its next own wake (event stream edge, timer, PMI, WFET
+    /// timeout, device-line cache expiry) within [`Self::idle_poll`] host
+    /// counts. That is the most the passes' own halt-poll would spin before
+    /// they halt, at most 200 us (`IDLE_POLL_HZ`): far under the 0.5 s one
+    /// exit may take, and no longer than today's spin to the same wake.
+    ///
+    /// The spin is a safe point (`Host::relax`) and serves host interrupts
+    /// as the halt-poll does. Mail (another PE's SEV or maintenance) is read
+    /// at once, before any block runs, and the WFE completes if that made
+    /// it ready. A host call, the host's service, a host interrupt or a
+    /// wake still ahead leave the wait to the passes (`None`), which then
+    /// find it as they do now; so do the home PE and a run with a deadline.
+    pub(super) fn short_event_wait(
+        &mut self,
+        run_deadline: Option<super::budget::Deadline>,
+    ) -> Option<Step> {
+        let hub = self.parallel.as_ref()?;
+        let pe = self.current;
+        let event_wait = self
+            .waiting
+            .is_some_and(|wait| wait.kind == super::WaitKind::Event && !wait.down);
+        if run_deadline.is_some()
+            || self.idle_poll == 0
+            || !event_wait
+            || self.cpu.monitor.is_some()
+            || hub.home.load(Ordering::Relaxed) == pe
+            || hub.woken(pe, self.lines_epoch)
+            || self.processor_paused(pe)
+            || self
+                .peers
+                .iter()
+                .any(|peer| matches!(peer, Peer::Parked(_)))
+            || self.devices.dma_deadline().is_some()
+            || self.devices.waits_on_host()
+        {
+            return None;
+        }
+        let start = self.host.counter();
+        let now = self.now();
+        if !self.ready(pe, now) {
+            let wake = self.own_wake(now)?;
+            let until = self.clock.wake_at(wake, start);
+            if until > start.saturating_add(self.idle_poll) {
+                return None;
+            }
+            loop {
+                let hub = self.parallel.as_ref()?;
+                if hub.woken(pe, self.lines_epoch) {
+                    if let Err(stop) = self.read_mail() {
+                        return Some(Err(stop));
+                    }
+                    let now = self.now();
+                    let hub = self.parallel.as_ref()?;
+                    if hub.woken(pe, self.lines_epoch) || !self.ready(pe, now) {
+                        self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+                        return None;
+                    }
+                    break;
+                }
+                if self.host.poll_interrupt() {
+                    self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+                    return None;
+                }
+                if self.host.counter() >= until {
+                    let now = self.now();
+                    if !self.ready(pe, now) {
+                        self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+                        return None;
+                    }
+                    break;
+                }
+                self.host.relax();
+            }
+        }
+        self.statistics.waits += 1;
+        self.statistics.short_waits += 1;
+        self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+        // As the passes start a PE they found ready.
+        self.slice_end = self.statistics.blocks + super::processors::QUANTUM;
+        self.slice_deadline =
+            self.host.counter() + self.profile.counter_frequency / super::processors::QUANTUM_HZ;
+        let share = self.runnable();
+        let work = self.work();
+        self.clock.start_slice(|| self.host.counter(), work, share);
+        let (retired, phases) = (self.cpu.retired, self.clock_phases());
+        self.clock.busy(|| self.host.counter(), retired, phases);
+        Some(self.wake())
+    }
+
+    /// The earliest count at which the running PE's own wait can end with
+    /// nobody else acting: its event stream edge, timer, PMI and WFET
+    /// timeout, and the expiry of its cached device lines.
+    fn own_wake(&mut self, now: u64) -> Option<u64> {
+        let wait = self.waiting?;
+        let lines = self
+            .device_lines
+            .filter(|&(_, _, pe)| pe == self.current)
+            .map(|(_, until, _)| until);
+        [
+            super::timer::next_event(&self.cpu, now),
+            self.timer_deadline(),
+            self.cpu.pmu.as_ref().and_then(|monitor| monitor.deadline()),
+            wait.timeout.map(|timeout| timeout.deadline(now)),
+            lines,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     /// Maintenance another PE broadcast, reached from this PE's context.
     fn maintain(&mut self, maintenance: Maintenance) -> Step {
         match maintenance {
@@ -1712,7 +1860,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let profile = self.observation_inbox(&hub).map(|inbox| &inbox.broadcasts);
         let started = profile.map(|_| self.host.counter());
-        let posted = hub.broadcast(self.current, &self.outgoing);
+        let held = &mut self.posted;
+        let posted = hub.broadcast_each(self.current, &self.outgoing, |pe, serial| {
+            match held.iter_mut().find(|(held, _)| *held == pe) {
+                Some((_, held)) => *held = serial,
+                None => held.push((pe, serial)),
+            }
+        });
         if let (Some(slot), Some(started)) = (profile, started) {
             for maintenance in &self.outgoing {
                 let kind = match maintenance {
@@ -1720,18 +1874,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     Maintenance::Code(_) => BroadcastKind::Code,
                     Maintenance::Power(_) => BroadcastKind::Power,
                 };
-                if let Some(active) = slot.begin(kind, started, posted.len()) {
+                if let Some(active) = slot.begin(kind, started, posted) {
                     slot.finish(active, 0, 0);
                 }
             }
         }
         self.outgoing.clear();
-        for (pe, serial) in posted {
-            match self.posted.iter_mut().find(|(held, _)| *held == pe) {
-                Some((_, held)) => *held = serial,
-                None => self.posted.push((pe, serial)),
-            }
-        }
     }
 
     /// Wait until every other running PE has applied the maintenance this
@@ -1765,6 +1913,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.host.relax();
         }
         hub.set_parked(self.current, false);
+        // `posted` is empty now: keep its buffer for the next DSB.
+        if self.posted.is_empty() {
+            self.posted = posted;
+        }
         self.statistics.broadcasts += 1;
         let elapsed = self.host.counter().wrapping_sub(started);
         self.statistics.sync_ticks += elapsed;
@@ -1803,6 +1955,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             line_ticks: statistics.line_ticks,
             sleep_ticks: statistics.sleep_ticks,
             spin_ticks: statistics.spin_ticks,
+            halt_ticks: statistics.halt_ticks,
+            short_waits: statistics.short_waits,
             sync_ticks: statistics.sync_ticks,
             waits: statistics.waits,
             broadcasts: statistics.broadcasts,
@@ -1821,9 +1975,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 statistics.engine_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],
                 statistics.native_transitions[stela_compiler::x86_64::transition::GUARDED_EXIT],
                 statistics.engine_transitions[stela_compiler::x86_64::transition::GUARDED_EXIT],
+                statistics.native_transitions[stela_compiler::x86_64::transition::SUPERVISOR_CALL],
+                statistics.engine_transitions[stela_compiler::x86_64::transition::SUPERVISOR_CALL],
+                statistics.native_transitions[stela_compiler::x86_64::transition::EXCEPTION_RETURN],
+                statistics.engine_transitions[stela_compiler::x86_64::transition::EXCEPTION_RETURN],
             ],
             transition_misses: {
-                let mut misses = [0; 2 * super::transitions::miss::REASONS];
+                let mut misses = [0; 4 * super::transitions::miss::REASONS];
                 misses.copy_from_slice(statistics.transition_misses.as_flattened());
                 misses
             },
@@ -1835,6 +1993,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 stamped[chain::STAMP_COUNTS + 2] = statistics.predicted_tails;
                 stamped
             },
+            pac_fills: self.pointer.fills,
             phases: self
                 .step_timing
                 .as_ref()
@@ -1855,7 +2014,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// which may wait on it: an event, maintenance, and a start, which is
     /// posted again for the PE's next mail read.
     fn wait_for_others(&mut self, hub: &Arc<Hub>) -> Step {
-        let Some(mail) = hub.take(self.current) else {
+        let mut spare = core::mem::take(&mut self.mail_spare);
+        let Some(mail) = hub.take_into(self.current, &mut spare) else {
+            self.mail_spare = spare;
             return Ok(());
         };
         if mail.event {
@@ -1872,6 +2033,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         hub.acknowledge(self.current, mail.serial);
+        self.mail_spare = mail.maintenance;
         if let Some(address) = mail.start {
             hub.start(self.current, address);
         }

@@ -186,8 +186,11 @@ pub struct SystemExits {
     pub devices: DeviceExits,
 }
 
-/// The keys [`SystemExits`] holds apart.
-pub const SYSTEM_KEYS: usize = 128;
+/// The keys [`SystemExits`] holds apart. The report merges every PE's into
+/// one table each beat, and a process spawn alone exits on well over 128
+/// keys machine-wide: with 128 the costliest of them landed in `other`
+/// (12-18 ms of exit time per spawn, unnamed).
+pub const SYSTEM_KEYS: usize = 512;
 
 impl Default for SystemExits {
     fn default() -> Self {

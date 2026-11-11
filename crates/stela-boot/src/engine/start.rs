@@ -177,6 +177,7 @@ fn start(handoff: u64) -> Started {
     // every native root for the complete engine lifetime.
     unsafe { crate::ALLOCATOR.initialize(heap as *mut u8, handoff.heap.bytes as usize) };
     crate::ALLOCATOR.reserve_tail(handoff.heap.bytes as usize / HEAP_RESERVE_SHARE);
+    super::large_blocks::install();
     // SAFETY: this loader-owned private seed is held in the shared physmap,
     // exclusively consumed here before any native service is published.
     if let Err(error) = unsafe { crate::random::initialize(handoff.random_seed) } {
@@ -202,6 +203,12 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
+    // Before any user of the rate: this image's copy has not been found.
+    crate::firmware::adopt_tsc(
+        handoff.tsc_hz,
+        handoff.tsc_source,
+        handoff.tsc_tolerance_ppm,
+    );
     crate::status::set_clock(handoff.tsc_hz);
     stela_drivers::on_wait(crate::status::tick);
     stela_drivers::on_work(crate::status::progress);
@@ -344,6 +351,14 @@ fn open_host(
         output::arguments(format_args!(
             "INSTALL OFFLINE macOS and Apple's signing answers are on the USB; no network is opened\n"
         ));
+        crate::status::info("Offline install: macOS and Apple's signing answers are on the USB");
+    } else if options.install.is_some() {
+        crate::status::info(match remote_image {
+            true => {
+                "Network install: macOS downloads and Apple's signing server is asked during the install"
+            }
+            false => "Network install: Apple's signing server is asked during the install",
+        });
     }
     let wants_network = (options.install.is_some() && !offline) || options.network_check.is_some();
     let mut devices = start_devices(
@@ -891,6 +906,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             backing,
             sep_state,
             board_flash,
+            rtc_anchor: host_nor.as_ref().and_then(nor::HostNor::loaded_anchor),
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.is_some(),
@@ -1282,6 +1298,8 @@ fn open_gpus(
         Ok(None)
     };
     let firmware = firmware.clone();
+    // Named on the screen when no GPU starts; the claim takes `adapters`.
+    let found = adapters.clone();
     let claiming = host::rdtsc();
     let claimed = work.call_owned(60_000_000, move || {
         let services = services::Services::new(mmio, remappers, None, heap, tsc_hz, Vec::new())
@@ -1300,7 +1318,7 @@ fn open_gpus(
             // Each GPU that did not start, and why, or that there is none.
             use stela_boot_core::gpu_status;
             match refused.split_first() {
-                None => crate::status::warn(&gpu_status::none()),
+                None => crate::status::warn(&gpu_status::none(&found)),
                 Some((first, rest)) => {
                     crate::status::warn(&gpu_status::refused(
                         &first.address,
@@ -1315,6 +1333,13 @@ fn open_gpus(
                         ));
                     }
                 }
+            }
+            // The display adapters Stela's GPU driver does not run, and why.
+            for adapter in found
+                .iter()
+                .filter(|adapter| adapter.vendor != stela_drivers::gpu::Vendor::Nvidia)
+            {
+                crate::status::info(&gpu_status::unused(adapter));
             }
             return false;
         }
@@ -1370,6 +1395,7 @@ struct Placement<'a> {
     backing: Option<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     sep_state: Option<stela_soc::machine::sep_state::Location>,
     board_flash: Option<nor::BoardFlash>,
+    rtc_anchor: Option<stela_soc::machine::RtcAnchor>,
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
     guest_bluetooth: bool,
@@ -1461,6 +1487,7 @@ fn place_devices(
                 unix_seconds: wall.unix_seconds_at(host::rdtsc(), handoff.tsc_hz),
                 counter: now,
             }),
+            rtc_anchor: placement.rtc_anchor,
             backing: placement.backing,
             sep_state: placement.sep_state,
             sep_observe: options.sep_observe,
@@ -2083,6 +2110,7 @@ fn prepare_restore(
             signer,
             fdr_storage,
             network: proxy_network,
+            signing_network: matches!(host_network, Some(Ok(_))),
         },
     )
     .unwrap_or_else(|error| {

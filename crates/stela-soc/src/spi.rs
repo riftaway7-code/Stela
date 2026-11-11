@@ -238,6 +238,11 @@ impl Spi {
         self.mmio_ready().is_ok() && !self.lifecycle.quiesced
     }
     fn pump(&mut self) -> Result<()> {
+        // An idle controller moves nothing: skip the rollback copies that
+        // every device advance would otherwise take.
+        if !self.active() || self.control & RUN == 0 {
+            return Ok(());
+        }
         let checkpoint = self.nor.checkpoint();
         let (tx, rx, tx_count, rx_count, status) =
             (self.tx, self.rx, self.tx_count, self.rx_count, self.status);

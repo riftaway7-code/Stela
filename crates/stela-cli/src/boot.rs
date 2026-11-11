@@ -302,6 +302,7 @@ fn mount(
             reset: Some(manifest.entry.physical_address),
             now: 0,
             wall: None,
+            rtc_anchor: None,
             backing: board.ans.is_some().then(|| {
                 Box::new(Sparse {
                     identity: stela_drivers::block::Identity {

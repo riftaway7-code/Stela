@@ -206,14 +206,51 @@ pub(in crate::engine) fn run_job(boot: bool) -> bool {
         0
     };
     shared().iter().any(|service| {
-        if boot {
-            service.run_job(older)
-        } else {
-            // SAFETY: an AP's host work between slices, which holds nothing
-            // its interrupts' handlers take; they save the vector state.
-            unsafe { with_interrupts(|| service.run_job(older)) }
+        if !service.jobs_waiting() {
+            return false;
         }
+        let run = || {
+            if boot {
+                service.run_job(older)
+            } else {
+                // SAFETY: an AP's host work between slices, which holds nothing
+                // its interrupts' handlers take; they save the vector state.
+                unsafe { with_interrupts(|| service.run_job(older)) }
+            }
+        };
+        measured_job(run)
     })
+}
+
+/// The most the heap's carved bytes rose during one job since the last
+/// `GPU JOBS` line, and the carved bytes that job started from.
+static JOB_RISE: AtomicU64 = AtomicU64::new(0);
+static JOB_RISE_FROM: AtomicU64 = AtomicU64::new(0);
+/// Set while a processor measures the job it runs.
+static MEASURING: AtomicBool = AtomicBool::new(false);
+
+/// Runs `run`, and when it ran a job, keeps how far the heap's carved
+/// bytes rose above where they were: a compile's own peak, as jobs run one
+/// at a time, with what other processors carved meanwhile. One processor
+/// measures at a time, as the heap keeps one mark.
+fn measured_job(run: impl FnOnce() -> bool) -> bool {
+    if MEASURING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return run();
+    }
+    let from = crate::ALLOCATOR.mark();
+    let ran = run();
+    if ran {
+        let rise = crate::ALLOCATOR.marked_peak().saturating_sub(from) as u64;
+        if rise > JOB_RISE.load(Ordering::Relaxed) {
+            JOB_RISE.store(rise, Ordering::Relaxed);
+            JOB_RISE_FROM.store(from as u64, Ordering::Relaxed);
+        }
+    }
+    MEASURING.store(false, Ordering::Release);
+    ran
 }
 
 /// Runs `body` with this processor's interrupts on.
@@ -700,7 +737,7 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         if jobs.ran != 0 || jobs.deferred != 0 {
             output::arguments(format_args!(
                 "GPU JOBS ran={} total_us={} longest_us={} longest_queued_us={} deferred={} \
-                 repeated={} forced={} waiting={}\n",
+                 repeated={} forced={} waiting={} heap_rise={}M from={}M\n",
                 jobs.ran,
                 micros(jobs.ticks),
                 micros(jobs.longest),
@@ -709,6 +746,8 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
                 jobs.repeated,
                 jobs.forced,
                 service.jobs_waiting(),
+                JOB_RISE.swap(0, Ordering::Relaxed) >> 20,
+                JOB_RISE_FROM.load(Ordering::Relaxed) >> 20,
             ));
         }
     }

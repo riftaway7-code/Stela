@@ -102,6 +102,11 @@ pub(super) struct Mirrors {
     /// was entered, which the engine takes when it returns
     /// ([`Machine::take_thread_switches`]).
     pub(super) switches: register_read::SwitchLog,
+    /// Nonzero while the engine holds an exclusive monitor of its own
+    /// (`Cpu::monitor`) or the PE's monitor and event register live in its
+    /// canonical memory, set as native code is entered: native ERET then
+    /// leaves clearing and signalling them to the engine.
+    pub(super) monitor: u64,
 }
 
 /// Where native code finds the cell at `index` of the PE's state.
@@ -148,15 +153,30 @@ pub(super) const DATA_BARRIER: usize = PAN_WRITES + 1;
 pub(super) const SEND_EVENT: usize = DATA_BARRIER + 1;
 pub(super) const EVENT_WAIT: usize = SEND_EVENT + 1;
 
+/// The cell of MSR TTBR0_EL1 (`x86_64::register_read::unchanged_write_thunk`),
+/// open on the storage a plain write reached: a write of the value the
+/// register holds completes natively and changes nothing, any other exits.
+/// A kernel rewrites the same table base at most switches into a thread of
+/// the address space it already runs.
+pub(super) const TABLE_BASE_KEPT: usize = EVENT_WAIT + 1;
+
+/// TTBR0_EL1 (TTBR0_EL2 at EL2 with E2H).
+pub(super) const TABLE_BASE: Encoding = Encoding::new(3, 0, 2, 0, 0);
+
 /// The cell of the first of the [`STORED_WRITES`].
-const STORED_WRITE_CELLS: usize = EVENT_WAIT + 1;
+const STORED_WRITE_CELLS: usize = TABLE_BASE_KEPT + 1;
 
 /// The IMPLEMENTATION DEFINED registers that a store completes writes of
 /// that get a cell of their own the first time code naming them is installed
 /// ([`Machine::stored_write_cell`]), open on the register's value once a
 /// write completes plainly. A kernel writes them around each thread switch.
-/// When there are more, the rest take System exits.
-pub(super) const STORED_WRITES: usize = 32;
+/// When there are more, the rest take System exits. Numbers go in install
+/// order and never free, and boot installs writes of dozens of tuning,
+/// control and counter registers (26A434 XNU alone writes over 40 stored
+/// ones) before the first thread switch, so room for the ones a kernel
+/// writes at every switch (thread keys, SPRR's field registers) must
+/// outlast those.
+pub(super) const STORED_WRITES: usize = 128;
 
 const CELLS: usize = STORED_WRITE_CELLS + STORED_WRITES;
 
@@ -177,7 +197,7 @@ pub(super) const MASK_WRITES: usize = MIRRORED.len() + STORED_CELLS;
 /// together (`Machine::open_pointers`). TPIDR_EL1's also update its open
 /// read cells in every state and log the thread switch for the engine's
 /// diagnostics ([`THREAD_SWITCH`]).
-pub(super) const WRITTEN: [(Encoding, SystemRegister); 17] = [
+pub(super) const WRITTEN: [(Encoding, SystemRegister); 18] = [
     (Encoding::new(3, 0, 4, 0, 1), SystemRegister::ELR_EL1),
     (Encoding::new(3, 0, 4, 0, 0), SystemRegister::SPSR_EL1),
     (STACK_ZERO, SystemRegister::SP_EL0),
@@ -197,6 +217,7 @@ pub(super) const WRITTEN: [(Encoding, SystemRegister); 17] = [
     (Encoding::new(3, 0, 2, 2, 3), SystemRegister::APDBKeyHi_EL1),
     (Encoding::new(3, 0, 2, 3, 0), SystemRegister::APGAKeyLo_EL1),
     (Encoding::new(3, 0, 2, 3, 1), SystemRegister::APGAKeyHi_EL1),
+    (CONTEXT_ID, SystemRegister::CONTEXTIDR_EL1),
     (registers::encodings::TPIDR_EL1, SystemRegister::TPIDR_EL1),
 ];
 
@@ -222,6 +243,12 @@ pub(super) const THREAD_SWITCH: register_read::ThreadSwitch = register_read::Thr
     log: Place::new(Anchor::Mirrors, offset_of!(Mirrors, switches)),
 };
 
+/// CONTEXTIDR_EL1 (CONTEXTIDR_EL2 at EL2 with E2H), which a kernel writes
+/// at each thread or address space switch: only debug and trace read it,
+/// context-aware breakpoints live from its storage, and it is not part of
+/// the prediction context (`PredictionContext`).
+pub(super) const CONTEXT_ID: Encoding = Encoding::new(3, 0, 13, 0, 1);
+
 /// SP_EL0, plain only with SP_ELx selected.
 pub(super) const STACK_ZERO: Encoding = Encoding::new(3, 0, 4, 1, 0);
 
@@ -238,6 +265,7 @@ impl Default for Mirrors {
             transitions: transition::Table::default(),
             lines_until: 0,
             switches: register_read::SwitchLog::default(),
+            monitor: 0,
         }
     }
 }
@@ -256,6 +284,12 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     interrupt_status: INTERRUPT_STATUS,
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     count: Place::new(Anchor::Count, 0),
+    monitor: Place::new(Anchor::Mirrors, offset_of!(Mirrors, monitor)),
+    pointer_tags: super::pointer::TAGS,
+    pointer_generation: Place::new(
+        Anchor::Pointer,
+        offset_of!(super::pointer::PointerService, generation),
+    ),
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
 
@@ -380,8 +414,8 @@ impl Mirrors {
 
 /// System registers whose writes leave the derived caches intact.
 /// Exception registers and thread pointers are read when used. TTBR0
-/// changes translation, and CONTEXTIDR changes prediction identity and
-/// live debug matches. Their writes still synchronize the host regime.
+/// changes translation, and its write still synchronizes the host regime.
+/// CONTEXTIDR changes only live debug matches, which read it when checked.
 pub(super) fn stored(register: SystemRegister) -> bool {
     use SystemRegister::*;
     matches!(
@@ -581,6 +615,19 @@ pub(super) fn written_register(pc: u64, word: u32) -> Option<(usize, u8)> {
     let instruction = block::decode_system_mode_instruction(GuestAddress(pc), word).ok()??;
     match instruction.operation {
         SystemOperation::Register(access) => Some((written(access)?, access.rt())),
+        _ => None,
+    }
+}
+
+/// Xt of the MSR TTBR0_EL1 `word` at `pc`, if it is one.
+pub(super) fn table_base_write(pc: u64, word: u32) -> Option<u8> {
+    let instruction = block::decode_system_mode_instruction(GuestAddress(pc), word).ok()??;
+    match instruction.operation {
+        SystemOperation::Register(access)
+            if access.encoding() == TABLE_BASE && access.direction() == Direction::Write =>
+        {
+            Some(access.rt())
+        }
         _ => None,
     }
 }

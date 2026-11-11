@@ -23,7 +23,7 @@ use core::{
     cell::Cell,
     panic::Location,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 use stela_boot_core::staged_disk::{self, DiskWorker};
 use stela_contracts::refuse;
@@ -200,22 +200,69 @@ fn try_lock_host_drivers() -> bool {
         .is_ok()
 }
 
-/// Take the host drivers' lock, counting the wait.
+/// Cores spinning for [`HOST_DRIVERS`] now ([`host_drivers_wanted`]).
+static HOST_DRIVERS_WAITERS: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a core waits for the host drivers' lock now: a holder that runs
+/// work in steps (the GPU pump) ends its turn at the next step boundary
+/// instead of at its budget, leaving the rest pending.
+pub(super) fn host_drivers_wanted() -> bool {
+    HOST_DRIVERS_WAITERS.load(Ordering::Relaxed) != 0
+}
+
+/// Where the current holder of [`HOST_DRIVERS`] took it, for the report
+/// of a wait that overran.
+static HOST_DRIVERS_SITE: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr::null_mut());
+
+/// The longest wait for [`HOST_DRIVERS`], in seconds: longer than the
+/// longest single timeout of a host driver (a controller's 60 s ready
+/// wait), so only a holder that never lets go reaches it.
+const HOST_DRIVERS_WAIT_SECONDS: u64 = 90;
+
+/// Take the host drivers' lock, counting the wait. A wait past
+/// [`HOST_DRIVERS_WAIT_SECONDS`] stops the mount with a report naming the
+/// holder instead of spinning forever.
 fn lock_host_drivers() -> u64 {
     if try_lock_host_drivers() {
         return 0;
     }
-    let started = super::host::rdtsc();
-    while HOST_DRIVERS
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        // A driver holding this lock can be retiring an aperture mapping.
-        // An interrupt cannot reach this waiter if it entered with IF clear.
-        crate::native_mmio::shootdown::service();
-        core::hint::spin_loop();
-    }
-    let waited = super::host::rdtsc().wrapping_sub(started);
+    // An unknown rate is taken as a fast one, so the bound only grows.
+    let hz = match crate::firmware::tsc_hz() {
+        0 => 10_000_000_000,
+        hz => hz,
+    };
+    HOST_DRIVERS_WAITERS.fetch_add(1, Ordering::Relaxed);
+    let spun = stela_boot_core::bounded_spin::spin(
+        || {
+            HOST_DRIVERS
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        },
+        super::host::rdtsc,
+        hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS),
+        || {
+            // A driver holding this lock can be retiring an aperture mapping.
+            // An interrupt cannot reach this waiter if it entered with IF clear.
+            crate::native_mmio::shootdown::service();
+            core::hint::spin_loop();
+        },
+    );
+    HOST_DRIVERS_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    let waited = match spun {
+        stela_boot_core::bounded_spin::Spin::Taken(waited) => waited,
+        stela_boot_core::bounded_spin::Spin::Overrun(waited) => {
+            let site = HOST_DRIVERS_SITE.load(Ordering::Relaxed);
+            // SAFETY: only `enter_locked` stores, a `&'static Location`.
+            let site = unsafe { site.as_ref() };
+            output::fatal(format_args!(
+                "host drivers lock not released after {} ms: held from {} on the processor \
+                 with gs {:#x}",
+                u128::from(waited) * 1000 / u128::from(hz),
+                site.map_or_else(|| String::from("unknown"), |site| format!("{site}")),
+                HOST_DRIVERS_GS.load(Ordering::Relaxed),
+            ))
+        }
+    };
     HOST_DRIVERS_WAITED[0].fetch_add(waited, Ordering::Relaxed);
     HOST_DRIVERS_WAITED[1].fetch_max(waited, Ordering::Relaxed);
     waited
@@ -328,6 +375,10 @@ impl RestoreRoot {
         // owner while IF0 excludes its own IRQ/reentrant root transition.
         let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
         HOST_DRIVERS_GS.store(gs, Ordering::Release);
+        HOST_DRIVERS_SITE.store(
+            ptr::from_ref(Location::caller()).cast_mut(),
+            Ordering::Relaxed,
+        );
         // A context or the host's state says so without a read of CR4, which
         // a hypervisor may intercept: disks are polled here thousands of times
         // a second.

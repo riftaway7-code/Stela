@@ -384,6 +384,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     page,
                     physical,
                     guarded: translation.guarded,
+                    global: translation.global,
                     el,
                     epoch: self.fetch_epoch(half),
                 });
@@ -409,7 +410,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     ) =>
             {
                 // On hardware an EL fetch of GL-only code enters GL at
-                // GXF_ABORT_EL1 (Sven Peter, for GL2); the saved state is
+                // GXF_ABORT_EL1 (as reported for GL2); the saved state is
                 // not documented.
                 Err(Err(self.unsupported(RequirementKind::Native(
                     "kernel-level fetch of guarded-only code (GXF abort entry)",
@@ -435,7 +436,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// no descriptor updates (no FEAT_HAFDBS), so the walk has no effect on
     /// memory. A global lower page that widens what the PE may hold is
     /// left to its fetch, which walks again.
-    pub(super) fn quiet_fetch_physical(&mut self, pc: u64) -> Option<(u64, bool)> {
+    pub(super) fn quiet_fetch_physical(&mut self, pc: u64) -> Option<(u64, bool, bool)> {
         let requester = self.cpu.requester();
         let controls = self.cpu.controls(self.cpu.regime());
         let mut tables = RamTables(&mut self.host);
@@ -455,7 +456,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Some((
             translation.physical & !(FETCH_PAGE - 1),
             translation.guarded,
+            translation.global,
         ))
+    }
+
+    /// Whether the walk of the page of `pc` that the fetch cache holds for
+    /// the current EL ended in a global leaf; true when the cache does not
+    /// hold it, which only makes more TLBIs reach the page's ITLB entry.
+    pub(super) fn fetched_global(&self, pc: u64) -> bool {
+        let page = pc & !(FETCH_PAGE - 1);
+        let slot = (page / FETCH_PAGE) as usize % FETCH_CACHE;
+        let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
+        self.fetch[slot].is_none_or(|entry| {
+            entry.page != page
+                || entry.el != el
+                || entry.epoch != self.fetch_epoch(chain::half(pc))
+                || entry.global
+        })
     }
 
     /// Whether the page of `pc`, which executes at the current EL, is guarded

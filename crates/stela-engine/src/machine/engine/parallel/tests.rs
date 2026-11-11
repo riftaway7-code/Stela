@@ -2333,3 +2333,146 @@ fn a_pe_that_joins_the_board_takes_stamps_of_its_table() {
     assert_eq!(control.cells, cache.targets.stamped_cells());
     assert!(cache.targets.holds_stamps(control.stamps));
 }
+
+/// A WFE of a PE that is not home ends inside the scheduler's entry when
+/// its next own wake is within the halt-poll: at its event stream edge, or
+/// earlier on another PE's SEV, with mail that came during the spin read
+/// before the guest runs again. A wake past the poll, and the home PE,
+/// take the wait passes.
+#[test]
+fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
+    use super::super::tests::{BASE, FakeHost, machine};
+    use crate::machine::NoDevices;
+    use crate::machine::system::Register as SystemRegister;
+    use crate::machine::system::TlbiKind::VAA;
+    const WFE: u32 = 0xd503_205f;
+    let start = |events: u64| {
+        let (hub, _) = hub(2);
+        let mut machine = machine(&[]);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        hub.home.store(1, Ordering::Relaxed);
+        machine.host.counter_step = 1;
+        machine.idle_poll = 300;
+        // CNTHCTL_EL2.EVNTEN with EVNTI `events`: edges 2^(events+1) apart.
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::CNTHCTL_EL2, 0, 1 << 2 | events << 4);
+        (hub, machine)
+    };
+    let wfe = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.cpu.pc = BASE;
+        machine.system_instruction(WFE).unwrap();
+        machine.schedule()
+    };
+    // Edges 128 counts apart: the spin reaches the next one.
+    let (_hub, mut machine) = start(6);
+    let edge = crate::machine::timer::next_event(&machine.cpu, machine.host.now).unwrap();
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none() && !machine.cpu.event);
+    assert_eq!(machine.cpu.pc, BASE + 4);
+    let statistics = &machine.statistics;
+    assert_eq!((statistics.waits, statistics.short_waits), (1, 1));
+    assert_eq!(statistics.halt_ticks, 0);
+    assert!(machine.host.timers.is_empty(), "no halt was armed");
+    assert!(machine.host.now >= edge && machine.host.now < edge + 100);
+    // Another PE's TLBI and SEV during the spin: both are read in it and
+    // the SEV ends the WFE before the edge.
+    let (hub, mut machine) = start(7);
+    let edge = crate::machine::timer::next_event(&machine.cpu, machine.host.now).unwrap();
+    let sender = Arc::clone(&hub);
+    machine.host.on_relax = Some(Box::new(move |turn| {
+        if turn == 3 {
+            sender.broadcast(1, &[tlbi(VAA, 0x1234)]);
+            sender.event(1);
+        }
+    }));
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none());
+    assert!(!hub.pending(0), "the mail was read");
+    assert_eq!(machine.statistics.short_waits, 1);
+    assert!(machine.host.now < edge, "the SEV ended it");
+    // Edges 65536 counts apart, past the poll: the wait passes take it.
+    let (_hub, mut machine) = start(15);
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none());
+    assert_eq!(machine.statistics.short_waits, 0);
+    assert!(machine.statistics.waits > 0);
+    // The home PE always takes the passes.
+    let (hub, mut machine) = start(6);
+    hub.home.store(0, Ordering::Relaxed);
+    wfe(&mut machine).unwrap();
+    assert_eq!(machine.statistics.short_waits, 0);
+}
+
+/// A device whose IRQ rises at `irq_at`, which a write sets; counts its
+/// advances where reading the count takes no lock.
+struct Armed {
+    irq_at: u64,
+    advances: Arc<AtomicUsize>,
+}
+
+impl Devices for Armed {
+    fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+        Ok(0)
+    }
+    fn write(&mut self, _: usize, _: u64, _: u8, value: u64, _: u64) -> Result<(), DeviceError> {
+        self.irq_at = value;
+        Ok(())
+    }
+    fn lines(&mut self, _: usize, now: u64) -> Lines {
+        Lines {
+            irq: now >= self.irq_at,
+            ..Lines::default()
+        }
+    }
+    fn deadline(&mut self, now: u64) -> Option<u64> {
+        self.advances.fetch_add(1, Ordering::Relaxed);
+        (now < self.irq_at).then_some(self.irq_at)
+    }
+}
+
+/// The home machine's wait pass advances the devices once: the deadline
+/// its cached lines came with stands in for a second advance, until
+/// another PE's call reaches the devices, such as one that arms an earlier
+/// deadline, which the next pass then sees.
+#[test]
+fn home_reuses_its_lines_deadline_until_another_pe_reaches_the_devices() {
+    use super::super::tests::board;
+    use stela_contracts::identity::Identity;
+    let (hub, _) = hub(2);
+    let count = Arc::new(AtomicUsize::new(0));
+    let home = SharedDevices::new(
+        Armed {
+            irq_at: 100,
+            advances: Arc::clone(&count),
+        },
+        hub,
+    );
+    let mut worker = home.worker();
+    let identities = vec![Identity {
+        midr: 0x611f_0320,
+        mpidr: 0x8000_0000,
+        clock: None,
+        caches: None,
+    }];
+    let mut machine = board(&[], home, identities);
+    let advances = |_: &Machine<_, SharedDevices<Armed>>| count.load(Ordering::Relaxed);
+    assert!(!machine.device_lines_of(0, 10).irq);
+    let before = advances(&machine);
+    assert_eq!(machine.next_deadline(10), Some(100));
+    assert_eq!(machine.next_deadline(20), Some(100));
+    assert_eq!(advances(&machine), before, "no second advance");
+    // PE 1 arms an earlier deadline: the next pass asks the devices.
+    worker.write(1, 0x30, 4, 50, 20).unwrap();
+    assert_eq!(machine.next_deadline(20), Some(50));
+    assert_eq!(advances(&machine), before + 1);
+    // Past the cached deadline the devices are asked again too.
+    machine.device_lines = None;
+    assert!(!machine.device_lines_of(0, 30).irq);
+    let before = advances(&machine);
+    assert_eq!(machine.next_deadline(40), Some(50));
+    assert_eq!(advances(&machine), before);
+    assert_eq!(machine.next_deadline(60), None);
+    assert_eq!(advances(&machine), before + 1);
+}

@@ -504,11 +504,25 @@ fn receive_keeps_up_across_the_ring_wrap() {
     let mut fixture = Fixture::new();
     let mut alx = fixture.attach(Fixture::chip(0x1091, 0)).unwrap();
     fixture.link(Some(GIGABIT_FULL));
+    let mut reused = Vec::with_capacity(MAX_FRAME);
+    let storage = reused.as_ptr();
     for round in 0..(RX_RING * 2) {
         let frame = vec![round as u8; 100];
         assert!(fixture.model.borrow_mut().deliver(&frame, 0, None));
-        assert_eq!(alx.receive(), Ok(Some(frame)));
+        if round % 2 == 0 {
+            assert_eq!(alx.receive(), Ok(Some(frame)));
+        } else {
+            // The stack's path refills its own buffer in place.
+            assert_eq!(alx.receive_reusing(&mut reused), Ok(true));
+            assert_eq!(reused, frame);
+            assert_eq!(reused.as_ptr(), storage);
+        }
     }
+    assert_eq!(alx.receive_reusing(&mut reused), Ok(false));
+    assert_eq!(reused, vec![(RX_RING * 2 - 1) as u8; 100]);
+    alx.stop().unwrap();
+    assert!(alx.receive_reusing(&mut reused).is_err());
+    assert_eq!(reused, vec![(RX_RING * 2 - 1) as u8; 100]);
 }
 
 #[test]

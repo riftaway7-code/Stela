@@ -66,3 +66,33 @@ fn transmit_without_carrier_is_refused_and_leaves_the_ring_untouched() {
     assert_eq!(net.transmit.descriptors.bytes(), descriptors);
     assert_eq!(registers[TX_POLL / 4], 0);
 }
+
+/// The stack's path refills its own buffer in place across the ring wrap,
+/// and leaves it unchanged when nothing arrived or the link failed.
+#[test]
+fn receive_reusing_refills_the_callers_buffer_across_the_wrap() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; 262_144];
+    let mut net = modelled(&mut registers, &mut memory, false);
+    net.receive.initialize(true);
+    let mut reused = Vec::with_capacity(MAX_FRAME);
+    let storage = reused.as_ptr();
+    let mut last = Vec::new();
+    for sequence in 0..(DESCRIPTORS * 2 + 3) {
+        let frame = vec![sequence as u8; 60 + sequence % 64];
+        net.receive.deliver(&frame);
+        if sequence % 2 == 0 {
+            assert_eq!(net.receive(), Ok(Some(frame.clone())));
+        } else {
+            assert_eq!(net.receive_reusing(&mut reused), Ok(true));
+            assert_eq!(reused, frame);
+            assert_eq!(reused.as_ptr(), storage);
+            last = frame;
+        }
+    }
+    assert_eq!(net.receive_reusing(&mut reused), Ok(false));
+    assert_eq!(reused, last);
+    net.link.failure = Some(BlockError::Timeout);
+    assert!(net.receive_reusing(&mut reused).is_err());
+    assert_eq!(reused, last);
+}

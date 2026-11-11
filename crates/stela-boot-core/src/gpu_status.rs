@@ -1,6 +1,7 @@
 //! What the boot screen says when no GPU started: which NVIDIA GPU was
 //! refused and why, in words a user can act on from another computer.
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
+use stela_drivers::gpu::{Adapter, Vendor};
 use stela_loader::host_firmware::recipes::nvidia_chip;
 
 /// The NVIDIA generations Stela's GPU driver runs (Turing, Ampere, Ada and
@@ -35,9 +36,45 @@ pub fn refused(address: &str, device: u16, reason: Reason) -> String {
     }
 }
 
-/// The screen line for a PC without an NVIDIA GPU.
-pub fn none() -> String {
-    format!("this PC has no NVIDIA GPU: Stela needs {SUPPORTED}")
+/// How the screen names a display adapter: its maker, PCI address and
+/// device ID.
+pub fn adapter(adapter: &Adapter) -> String {
+    let maker = match adapter.vendor {
+        Vendor::Nvidia => String::from("NVIDIA"),
+        Vendor::Amd => String::from("AMD"),
+        Vendor::Intel => String::from("Intel"),
+        Vendor::Other(id) => format!("PCI vendor {id:04x}"),
+    };
+    format!(
+        "the {maker} display adapter at {} (device {:04x})",
+        adapter.address, adapter.device
+    )
+}
+
+/// The line for a display adapter Stela's GPU driver does not run, and why.
+pub fn unused(found: &Adapter) -> String {
+    format!(
+        "{} is not used: {}",
+        adapter(found),
+        found.unavailable_reason()
+    )
+}
+
+/// The screen line for a PC without an NVIDIA GPU, naming the display
+/// adapters it has instead.
+pub fn none(adapters: &[Adapter]) -> String {
+    let found: Vec<String> = adapters
+        .iter()
+        .filter(|found| found.vendor != Vendor::Nvidia)
+        .map(adapter)
+        .collect();
+    match found.is_empty() {
+        true => format!("this PC has no NVIDIA GPU: Stela needs {SUPPORTED}"),
+        false => format!(
+            "this PC has no NVIDIA GPU, only {}: Stela needs {SUPPORTED}",
+            found.join(" and ")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -68,6 +105,36 @@ mod tests {
             "the NVIDIA GPU at 01:00.0 (device 1b80) is not supported: Stela needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
-        assert!(none().starts_with("this PC has no NVIDIA GPU: Stela needs"));
+        assert!(none(&[]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
+    }
+
+    #[test]
+    fn a_pc_with_only_other_display_adapters_names_them() {
+        use stela_drivers::bus::pci::Address;
+        let at = |bus, vendor, device| Adapter {
+            address: Address {
+                segment: 0,
+                bus,
+                device: 0,
+                function: 0,
+            },
+            vendor,
+            device,
+            class: [3, 0, 0],
+        };
+        let amd = at(3, Vendor::Amd, 0x744c);
+        let intel = at(0, Vendor::Intel, 0xa780);
+        assert_eq!(
+            none(&[amd, intel]),
+            "this PC has no NVIDIA GPU, only the AMD display adapter at 0000:03:00.0 (device \
+             744c) and the Intel display adapter at 0000:00:00.0 (device a780): Stela needs an \
+             NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
+        );
+        assert_eq!(
+            unused(&amd),
+            "the AMD display adapter at 0000:03:00.0 (device 744c) is not used: AMDGPU is not \
+             ported to Stela"
+        );
+        assert!(adapter(&at(1, Vendor::Other(0x1af4), 0x1050)).contains("PCI vendor 1af4"));
     }
 }

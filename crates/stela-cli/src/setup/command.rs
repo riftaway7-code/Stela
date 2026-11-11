@@ -342,7 +342,8 @@ struct Create {
     translation_store_bytes: Option<u64>,
     /// The model or size, as setup shows it, of the whole disk `--usb`
     /// names, which erasing a removable disk other than a USB (an SD card,
-    /// a FireWire or Thunderbolt disk) needs typed back.
+    /// a FireWire or Thunderbolt disk), or any disk without a terminal to
+    /// ask at, needs typed back.
     #[arg(long, value_name = "MODEL|SIZE")]
     confirm_disk: Option<String>,
 }

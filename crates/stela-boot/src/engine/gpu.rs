@@ -1141,6 +1141,18 @@ pub(super) fn claim_all(
         device: adapter.device,
         reason,
     };
+    for adapter in adapters
+        .iter()
+        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia)
+    {
+        output::arguments(format_args!(
+            "GPU {} vendor={:?} device={:04x} unused: {}\n",
+            adapter.address,
+            adapter.vendor,
+            adapter.device,
+            adapter.unavailable_reason()
+        ));
+    }
     let nvidia = adapters
         .iter()
         .filter(|adapter| adapter.vendor == gpu::Vendor::Nvidia);
@@ -2023,7 +2035,13 @@ pub(super) fn pump() {
                 serving,
             );
             steps += 1;
-            if super::service::shutdown_pending() || host::rdtsc().wrapping_sub(started) >= budget {
+            // A core spinning for the host drivers' lock this pump holds
+            // (a disk or input call) takes it after this step; the rest
+            // stays pending for the next pump.
+            if super::service::shutdown_pending()
+                || host::rdtsc().wrapping_sub(started) >= budget
+                || super::storage::host_drivers_wanted()
+            {
                 if !gpu.events.pending.swap(true, Ordering::AcqRel) {
                     PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
                 }
@@ -2168,7 +2186,7 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         longest.join("/"),
         names = PumpPart::NAMES.join("/"),
     );
-    let linux = linux_report(take(&PUMPS.steps));
+    let linux = linux_report(take(&PUMPS.steps), tsc_hz);
     Some(pumps + &linux + &nvkm)
 }
 
@@ -2194,8 +2212,13 @@ struct LinuxCounts {
 /// high-resolution) and work items that ran in the environment, most first,
 /// by function as an offset in this image (`other:N` for the rest), the tasks
 /// a timeout woke by the work item or thread function they ran (`-` for
-/// neither) and in all, and the Linux steps the pumps ran.
-fn linux_report(steps: u64) -> String {
+/// neither) and in all, and the Linux steps the pumps ran. Then
+/// `step_us=select/body/after empty_us=N empties=N scans=N locks=N clocks=N`:
+/// the work dispatchers' time (all runtimes) in steps that ran a task (entry to the switch, the
+/// task's run, return to exit), its time and count of steps that found
+/// nothing, its job-slot scans for idle tasks, its queue locks, and the
+/// native clock's samples.
+fn linux_report(steps: u64, tsc_hz: u64) -> String {
     /// Functions listed per kind.
     const TOP: usize = 4;
     unsafe extern "C" {
@@ -2244,12 +2267,23 @@ fn linux_report(steps: u64) -> String {
         }
         line
     };
+    let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
+    let step = stela_drivers::platform::work::step_counts::take();
     format!(
-        "\nGPU LINUX timers={} works={} sleepers={} timeouts={} steps={steps}",
+        "\nGPU LINUX timers={} works={} sleepers={} timeouts={} steps={steps} \
+         step_us={}/{}/{} empty_us={} empties={} scans={} locks={} clocks={}",
         list(&counts.timers),
         list(&counts.works),
         list(&counts.sleepers),
         counts.timeouts.swap(0, Ordering::Relaxed),
+        micros(step.select),
+        micros(step.body),
+        micros(step.after),
+        micros(step.empty),
+        step.empty_steps,
+        step.scans,
+        step.locks,
+        crate::native_clock::SAMPLES.swap(0, Ordering::Relaxed),
     )
 }
 

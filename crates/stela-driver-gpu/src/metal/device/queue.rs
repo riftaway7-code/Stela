@@ -1607,7 +1607,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// Submits ready held work, retires completed command buffers and
     /// returns the completed serial.
     pub fn poll(&mut self) -> Result<u64> {
-        let result = self.poll_inner(None);
+        let result = self.poll_inner(None, false);
         if result == Err(Error::DeviceLost) {
             self.mark_lost();
         }
@@ -1619,7 +1619,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// kernel call) unless work completes on the late timeline. The answer
     /// may lag the GPU, never lead it.
     pub fn poll_reached(&mut self, timeline: u64) -> Result<u64> {
-        let result = self.poll_inner(Some(timeline));
+        let result = self.poll_inner(Some(timeline), false);
         if result == Err(Error::DeviceLost) {
             self.mark_lost();
         }
@@ -1752,7 +1752,42 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         }
     }
 
-    fn poll_inner(&mut self, known: Option<u64>) -> Result<u64> {
+    /// [`Self::poll`] taking the completion marker's serial as the queue's
+    /// timeline when no work completes on the late timeline: a guest's
+    /// poll then needs no driver query (a host kernel call a guest
+    /// processor waits for the boot processor to serve) even while held
+    /// work keeps completion from being published, and even when nothing
+    /// new completed. The marker never leads the timeline, so the answer
+    /// may lag, never lead. A loss is still noticed by the platform's look,
+    /// which asks the driver whenever the marker shows nothing new.
+    pub fn poll_marked(&mut self) -> Result<u64> {
+        match self.marker_serial() {
+            Some(marked) if !self.late_in_flight() => {
+                let result = self.poll_inner(Some(marked.max(self.completed)), true);
+                if result == Err(Error::DeviceLost) {
+                    self.mark_lost();
+                }
+                result
+            }
+            _ => self.poll(),
+        }
+    }
+
+    /// The serial the completion marker shows, widened from its 32 bits
+    /// against the newest serial submitted.
+    fn marker_serial(&self) -> Option<u64> {
+        let word = self.completion_word()?;
+        // SAFETY: the word is this device's mapped marker, alive with it.
+        let low = u64::from(unsafe { word.as_ref() }.load(core::sync::atomic::Ordering::Acquire));
+        let value = (self.submitted & !0xffff_ffff) | low;
+        if value > self.submitted {
+            value.checked_sub(1 << 32)
+        } else {
+            Some(value)
+        }
+    }
+
+    fn poll_inner(&mut self, known: Option<u64>, trusted: bool) -> Result<u64> {
         self.advance()?;
         if self.lost {
             return Err(Error::DeviceLost);
@@ -1770,7 +1805,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let timeline = match known {
             // A value that shows no progress may hide a loss, which only the
             // driver's answer says.
-            Some(timeline) if !self.late_in_flight() && timeline > self.completed => timeline,
+            Some(timeline) if !self.late_in_flight() && (trusted || timeline > self.completed) => {
+                timeline
+            }
             _ => {
                 let timeline = self.backend.semaphore_value(self.timeline);
                 timeline.inspect_err(|error| self.lost |= lost(error))?

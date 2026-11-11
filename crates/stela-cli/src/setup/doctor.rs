@@ -579,6 +579,19 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
     efi_status(environment, &record, &mut report);
     firmware_status(&record, &mut report);
     bundle_status(environment, &record, &mut report);
+    if record.installs_media() {
+        let restore_bundles: Vec<PathBuf> = record
+            .bundles
+            .iter()
+            .filter(|kept| kept.kind == bundle::Kind::Restore && kept.build == record.build)
+            .map(|kept| kept.directory(&record.volume))
+            .collect();
+        let remote = record.active_medium().is_some_and(|medium| medium.remote);
+        report.line(
+            "install",
+            super::create::network_status(remote, &restore_bundles),
+        );
+    }
     translations_status(&record, &mut report);
     for install in &record.installs {
         install_status(environment, &record, install, &mut report);

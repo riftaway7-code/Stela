@@ -385,6 +385,7 @@ fn read_piece(
     })?;
     if let Some(out) = out {
         out.sync_all()?;
+        crate::progress::drop_cached(&out);
     }
     Ok(())
 }

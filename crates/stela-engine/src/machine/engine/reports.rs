@@ -369,13 +369,16 @@ pub(super) enum StoreSource {
     Pack,
     /// Compiled by another PE of this boot and installed here.
     Shared,
+    /// Relocated from an entry proven during this boot, compiled at
+    /// another address of the same page content ([`super::rebase`]).
+    Rebased,
 }
 
 impl StoreSource {
-    pub(super) const COUNT: usize = 4;
+    pub(super) const COUNT: usize = 5;
 }
 
-const _: () = assert!(StoreSource::Shared as usize + 1 == StoreSource::COUNT);
+const _: () = assert!(StoreSource::Rebased as usize + 1 == StoreSource::COUNT);
 
 /// Why the ITLB lacked a page it then took ([`Statistics::itlb_misses`]): a
 /// fill of another page took its entry's place, a TLBI by VA dropped it,
@@ -552,9 +555,9 @@ pub struct Statistics {
     pub native_transitions: [u64; transition::KINDS],
     /// Those the engine completed, by the same kinds.
     pub engine_transitions: [u64; transition::KINDS],
-    /// Why GENTER, then GEXIT, at EL2 took the engine path, by
-    /// `transitions::miss` reason.
-    pub transition_misses: [[u64; super::transitions::miss::REASONS]; 2],
+    /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
+    /// (`x86_64::transition`) and `transitions::miss` reason.
+    pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
     /// AMX moves completed inside blocks (`x86_64::amx_transfer`) and by
     /// the engine's service.
     pub amx_moves: [u64; 2],
@@ -611,6 +614,13 @@ pub struct Statistics {
     /// granule sends.
     pub sleep_ticks: u64,
     pub spin_ticks: u64,
+    /// Of `sleep_ticks`, those from the timer's arming to the wake in the
+    /// host halt itself, past the halt-poll (`poll_for_wake`): the rest of
+    /// `sleep_ticks` the host core spun.
+    pub halt_ticks: u64,
+    /// Of `waits`, WFEs completed inside their exit by a short bounded spin
+    /// (`processors::Machine::short_event_wait`), without a scheduler pass.
+    pub short_waits: u64,
     /// With every PE on a core of its own: maintenance this PE broadcast,
     /// device accesses it forwarded to the home machine, and the counter
     /// ticks it spent waiting on other PEs for those or parked while the
@@ -686,6 +696,8 @@ impl core::ops::AddAssign for Statistics {
             degraded,
             sleep_ticks,
             spin_ticks,
+            halt_ticks,
+            short_waits,
             broadcasts,
             forwards,
             sync_ticks,
@@ -813,6 +825,8 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.degraded, degraded),
             (&mut self.sleep_ticks, sleep_ticks),
             (&mut self.spin_ticks, spin_ticks),
+            (&mut self.halt_ticks, halt_ticks),
+            (&mut self.short_waits, short_waits),
             (&mut self.broadcasts, broadcasts),
             (&mut self.forwards, forwards),
             (&mut self.sync_ticks, sync_ticks),

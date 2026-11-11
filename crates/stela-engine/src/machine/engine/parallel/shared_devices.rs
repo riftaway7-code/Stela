@@ -36,6 +36,10 @@ pub(super) struct Board<D> {
     /// it passed while home is outside its run loop
     /// ([`SharedDevices::advance_for_home`]).
     pub(super) time: AtomicU64,
+    /// Locked calls so far, bumped as each releases the lock: the home
+    /// machine keeps the deadline its last advance gave while this moved
+    /// by its own call alone ([`Devices::generation`]).
+    pub(super) generation: AtomicU64,
     pub(super) reset: Mutex<Option<Reset>>,
     pub(super) resetting: AtomicBool,
     /// PE starts the devices made, which every machine asks for at every
@@ -325,6 +329,9 @@ impl<D: Devices> Drop for Held<'_, D> {
         if held > self.board.longest[call].load(Ordering::Relaxed) {
             self.board.longest[call].store(held, Ordering::Relaxed);
         }
+        // Before the release: a reader that saw the lock free after this
+        // call sees its bump.
+        self.board.generation.fetch_add(1, Ordering::AcqRel);
         // SAFETY: dropped once, here, and not used after.
         unsafe { ManuallyDrop::drop(&mut self.state) };
         if self.wakes != 0 {
@@ -408,6 +415,7 @@ impl<D: Devices> SharedDevices<D> {
             pins: (0..pes).map(|_| AtomicU8::new(UNLATCHED)).collect(),
             dma: AtomicU64::new(u64::MAX),
             time: AtomicU64::new(u64::MAX),
+            generation: AtomicU64::new(0),
             reset: Mutex::new(None),
             resetting: AtomicBool::new(false),
             starts: Mutex::new(VecDeque::new()),
@@ -913,6 +921,10 @@ impl<D: Devices> Devices for SharedDevices<D> {
     }
     /// Only the home machine moves devices' asynchronous DMA, through its
     /// host's canonical RAM owner.
+    fn generation(&self) -> Option<u64> {
+        self.home
+            .then(|| self.board.generation.load(Ordering::Acquire))
+    }
     fn dma_deadline(&self) -> Option<u64> {
         if !self.home {
             return None;

@@ -92,6 +92,7 @@ fn write_from(
             Ok(())
         })?;
         file.sync_all()?;
+        crate::progress::drop_cached(&file);
         let (sha256, blocks) = hashes.finish();
         pieces.push(Piece {
             bytes: size,

@@ -1,10 +1,10 @@
-//! FP min/max: normal-or-zero S/D selection and normal H integer ordering.
+//! FP min/max: ordered (normal, infinite, S/D zero) selection and Half integer ordering.
 use super::super::isa::ShiftOpcode;
 use super::numerical::helper_section;
 use super::numerical::{
     Condition, INPUT_MINIMUM_EXPONENT, branch, clear_high_qword, clear_scalar, exponent_range,
-    jump, prepare_vector_input_range, read_numerical_vector, resolve, test_control,
-    vector_exponent_range, vector_normal_or_zero_range, zero_scalar,
+    infinity_scalar, jump, prepare_vector_input_range, read_numerical_vector, resolve,
+    test_control, vector_ordered_range, zero_scalar,
 };
 use super::{Host, commit, packed, packed_imm, read_vector};
 use crate::x86_64::asm::{Code, Gpr, Rm, vector_extensions};
@@ -178,26 +178,25 @@ fn exception_guard(code: &mut Code, helper: &mut Vec<usize>) {
     helper.push(branch(code, Condition::NotZero));
 }
 
+/// Infinities are ordinary ordered values for every selection here (and in
+/// Half's order key), so only NaNs, subnormals and Half zeros exit.
 fn input_guard(code: &mut Code, format: Format, shape: Shape, source: u8, helper: &mut Vec<usize>) {
     if shape == Shape::Scalar {
-        let zero = if format != Format::Half {
+        let mut accepted = Vec::new();
+        if format != Format::Half {
             zero_scalar(code, format, source);
-            Some(branch(code, Condition::Zero))
-        } else {
-            None
-        };
+            accepted.push(branch(code, Condition::Zero));
+        }
+        infinity_scalar(code, format, source);
+        accepted.push(branch(code, Condition::Zero));
         exponent_range(code, format, source, INPUT_MINIMUM_EXPONENT);
         helper.push(branch(code, Condition::AboveOrEqual));
-        if let Some(zero) = zero {
-            let end = code.len();
-            resolve(code, zero, end);
+        let end = code.len();
+        for patch in accepted {
+            resolve(code, patch, end);
         }
     } else {
-        if format == Format::Half {
-            vector_exponent_range(code, format, shape, source);
-        } else {
-            vector_normal_or_zero_range(code, format, shape, source, PAIR_VECTOR);
-        }
+        vector_ordered_range(code, format, shape, source, PAIR_VECTOR);
         helper.push(branch(code, Condition::NotZero));
     }
 }

@@ -4,6 +4,7 @@
 //! [`Host`].
 pub mod amu;
 pub mod amx;
+pub mod aon;
 mod capabilities;
 pub mod cpu;
 pub mod ctrr;

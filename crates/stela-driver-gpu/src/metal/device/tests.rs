@@ -103,6 +103,43 @@ fn devices_missing_a_required_feature_are_refused() {
     assert!(matches!(device, Err(Error::Unsupported("nullDescriptor"))));
 }
 
+/// A guest's poll takes the completion marker's serial as the timeline: no
+/// driver query, whether or not the marker shows something new; without a
+/// marker the driver is asked as before.
+#[test]
+fn a_marked_poll_needs_no_driver_query() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut backend = MockBackend::new();
+    backend.marker = Some(alloc::boxed::Box::new(AtomicU32::new(0)));
+    let mut device = device_on(backend);
+    let first = submit(&mut device);
+    let second = submit(&mut device);
+    // A query would fail and lose the device.
+    device.backend().semaphore_error = Some(Error::DeviceLost);
+    assert_eq!(device.poll_marked(), Ok(0), "nothing marked yet");
+    device
+        .backend()
+        .marker
+        .as_ref()
+        .unwrap()
+        .store(first as u32, Ordering::SeqCst);
+    assert_eq!(device.poll_marked(), Ok(first));
+    assert_eq!(device.reached_for(0), first);
+    device
+        .backend()
+        .marker
+        .as_ref()
+        .unwrap()
+        .store(second as u32, Ordering::SeqCst);
+    assert_eq!(device.poll_marked(), Ok(second));
+    assert!(!device.is_lost());
+    // The driver was never asked: its error is still waiting.
+    assert_eq!(device.poll(), Ok(second), "nothing in flight to ask about");
+    let third = submit(&mut device);
+    assert_eq!(device.poll(), Err(Error::DeviceLost));
+    assert!(third > second);
+}
+
 #[test]
 fn destruction_waits_for_submitted_work() {
     let mut device = device();

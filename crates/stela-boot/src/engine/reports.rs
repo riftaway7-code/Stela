@@ -222,6 +222,9 @@ pub(super) struct WordsDiff {
     words: BTreeMap<u32, u64>,
     after: Option<u32>,
     top: Vec<(u64, u32)>,
+    /// Whether `words` came from a walk of the blocks: without `--profile`
+    /// the beat skips it ([`Self::unwalked`]).
+    walked: bool,
 }
 
 impl WordsDiff {
@@ -231,6 +234,18 @@ impl WordsDiff {
             words,
             after: None,
             top: Vec::new(),
+            walked: true,
+        }
+    }
+
+    /// No walk this beat: `last` is [`ExitsSeen::words`], kept as it is, so
+    /// no word shows a change and the next walk compares with the last one.
+    pub(super) fn unwalked(last: BTreeMap<u32, u64>) -> Self {
+        Self {
+            words: last,
+            after: None,
+            top: Vec::new(),
+            walked: false,
         }
     }
 }
@@ -241,6 +256,9 @@ impl ExitsSeen {
     /// `more` every 256 words; whether every word was compared.
     pub(super) fn diff_step(&self, diff: &mut WordsDiff, mut more: impl FnMut() -> bool) -> bool {
         use core::ops::Bound::{Excluded, Unbounded};
+        if !diff.walked {
+            return true;
+        }
         let start = diff.after.map_or(Unbounded, Excluded);
         let mut last = self.words.range((start, Unbounded)).peekable();
         for (compared, (&word, &count)) in diff.words.range((start, Unbounded)).enumerate() {
@@ -288,7 +306,12 @@ impl ExitsSeen {
             statistics.table_base_changes,
             statistics.code_invalidations,
         ];
-        let WordsDiff { words, mut top, .. } = diff;
+        let WordsDiff {
+            words,
+            mut top,
+            walked,
+            ..
+        } = diff;
         // Only the shown words in order; the rest only add to the share.
         if top.len() > SHOWN {
             top.select_nth_unstable_by(SHOWN, |a, b| b.cmp(a));
@@ -333,6 +356,11 @@ impl ExitsSeen {
         for (index, (now, last)) in transitions.iter().zip(&self.transitions).enumerate() {
             let separator = if index == 0 { " native=" } else { "," };
             output::arguments(format_args!("{separator}{}", now - last));
+        }
+        if !walked {
+            // The walk of every block for the exits by word runs with
+            // `--profile` only.
+            output::arguments(format_args!(" words=profile-only"));
         }
         // The share of the exits by word the shown words make up.
         let counted: u64 = top.iter().map(|&(count, _)| count).sum();

@@ -605,6 +605,8 @@ pub fn fatal(frame: &Frame) -> ! {
     // SAFETY: the interrupted stack's page, which a fault that left it
     // unreadable would have stopped on as a double fault before printing this.
     unsafe { output::print_stack_at(frame.rsp as *const u64) };
+    // SAFETY: the same page.
+    let callers = unsafe { output::Callers::at(frame.rsp as *const u64) };
     // The detail above reaches only the port. The message carries it to the
     // screen and the boot log, all a PC without a serial port keeps.
     unsafe extern "C" {
@@ -612,7 +614,7 @@ pub fn fatal(frame: &Frame) -> ! {
     }
     output::fatal(format_args!(
         "unexpected x86 exception in the system engine: vector={} error={:#x} rip={:#x} \
-         (image+{:#x}) cr2={:#x}",
+         (image+{:#x}) cr2={:#x} stack={callers}",
         frame.vector,
         frame.error,
         frame.rip,

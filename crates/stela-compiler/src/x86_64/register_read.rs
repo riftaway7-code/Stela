@@ -235,6 +235,20 @@ pub fn stored_write_thunk(pc: GuestAddress, rt: u8, cell: Place, written: Writte
     finish(code, miss, pc)
 }
 
+/// The thunk completing `MSR <register>, Xt` at `pc` when the value, as the
+/// register takes it, equals what the storage the `value` of the cell at
+/// `cell` points at holds already: such a write changes nothing. Any other
+/// value, or a closed cell, exits at `pc`.
+pub fn unchanged_write_thunk(pc: GuestAddress, rt: u8, cell: Place, written: Written) -> Thunk {
+    let (mut code, miss) = open(cell);
+    let mut asm = Asm::new(&mut code);
+    asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
+    written.apply(&mut asm, rt);
+    asm.alu_load(Alu::Cmp, Size::Qword, Gpr::Rax, Mem::base(Gpr::Rcx, 0));
+    let changed = asm.jcc(Cond::Ne);
+    finish_unless(code, [miss, changed], pc)
+}
+
 /// [`stored_write_thunk`] of a register that keeps what it is written, unless
 /// the value has one of the bits `refused`.
 pub fn checked_write_thunk(pc: GuestAddress, rt: u8, cell: Place, refused: u64) -> Thunk {

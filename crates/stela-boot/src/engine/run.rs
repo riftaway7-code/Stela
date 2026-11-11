@@ -88,10 +88,11 @@ pub(super) fn profile_report(
 
 /// `PES SYSTEM count/ns/closes`: every PE's System exits since the last
 /// beat by key (`step_timing::system_key_name`), the eight most frequent,
-/// then the eight costliest, each with its total handling time and the exits
+/// then the sixteen costliest, each with its total handling time and the exits
 /// that closed every mirror cell; `other` holds keys past the table's.
 fn system_exits_report(exits: &step_timing::SystemExits, tsc_hz: u64) {
     const SHOWN: usize = 8;
+    const SHOWN_BY_TIME: usize = 16;
     let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let item = |name: &str, exit: &step_timing::SystemExit| {
         format!(
@@ -109,7 +110,7 @@ fn system_exits_report(exits: &step_timing::SystemExits, tsc_hz: u64) {
     }
     line.push_str(" by_time");
     keys.sort_unstable_by_key(|exit| core::cmp::Reverse(exit.ticks));
-    for exit in keys.iter().take(SHOWN) {
+    for exit in keys.iter().take(SHOWN_BY_TIME) {
         line.push_str(&item(&step_timing::system_key_name(exit.key), exit));
     }
     if exits.other.count != 0 {
@@ -976,6 +977,14 @@ impl Heartbeat {
         let budget = tsc_hz / 1_000_000 * STEP_MICROS;
         let more = || host::rdtsc().wrapping_sub(started) < budget;
         let (name, next) = match stage {
+            // The walk of every block costs about 16 ms a beat on a booted
+            // desktop: it runs only while profiling.
+            BeatStage::Exits(_) if machine.step_timing().is_none() => (
+                "exits",
+                Some(BeatStage::ExitsDiff(WordsDiff::unwalked(core::mem::take(
+                    &mut self.exits.words,
+                )))),
+            ),
             BeatStage::Exits(mut walk) => {
                 let next = if machine.exit_words_step(&mut walk, more) {
                     BeatStage::ExitsDiff(WordsDiff::new(machine.exit_words_finish(walk)))
@@ -1135,7 +1144,8 @@ impl Heartbeat {
             // Per PE: idle, monitor-polling and synchronizing shares of
             // the interval, its waits, and the blocks it compiled and
             // installed from another PE.
-            let mut shares = String::from("PES TIME idle%/spin%/sync%/waits/compiled/shared");
+            let mut shares =
+                String::from("PES TIME idle%/spin%/sync%/waits/compiled/shared/halt%/short");
             // Per PE: the interval's share compiling, reading and hashing
             // fetch pages, finding shared blocks and installing blocks.
             let mut fetches = String::from("PES FETCH compile%/page%/shared%/install%");
@@ -1187,10 +1197,11 @@ impl Heartbeat {
             // or none), contexts made, TLBIs its mail merged, and pages
             // walked again at once for contexts made anew.
             // Per PE: GENTER completed natively and by the engine, then
-            // GEXIT's.
-            let mut transitions = String::from("PES TRANSITIONS genter/engine/gexit/engine");
-            // All PEs: why GENTER and GEXIT at EL2 took the engine path.
-            let mut transition_misses = [0u64; 16];
+            // GEXIT's, SVC's and ERET's.
+            let mut transitions =
+                String::from("PES TRANSITIONS genter/engine/gexit/engine/svc/engine/eret/engine");
+            // All PEs: why SVC, ERET, GENTER and GEXIT took the engine path.
+            let mut transition_misses = [0u64; 32];
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
@@ -1198,16 +1209,19 @@ impl Heartbeat {
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered
             // to it), compiled where it keys none (one instruction, a
-            // device-site page), taken from the pack, taken from another PE.
+            // device-site page), taken from the pack, taken from another
+            // PE, rebased from an entry proven at another address during
+            // the boot.
             let mut store = String::from(concat!(
-                "PES STORE user_compiled/user_unstorable/user_pack/user_shared",
-                "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared",
+                "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
+                "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
             ));
             let mut stamped = String::from(
                 "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
             );
             let mut stamped_in_use = 0;
             let mut predicted = 0;
+            let mut pac_fills = 0;
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
                 line.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.iter().zip(before).enumerate() {
@@ -1235,8 +1249,9 @@ impl Heartbeat {
             // interval's share evicting. On a shared board one census
             // counts for the board: evicted by any PE, never on the board
             // before, and never elsewhere.
-            let mut installs =
-                String::from("PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%");
+            let mut installs = String::from(
+                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns",
+            );
             let tsc_percent = |ticks: u64| u128::from(ticks) * 100 / u128::from(elapsed.max(1));
             // With `--profile`: the exits of every PE together, by kind, as
             // `PROFILE exits` gives the home machine's.
@@ -1260,13 +1275,15 @@ impl Heartbeat {
                     / 1_000_000;
                 rates.push_str(&format!(" {pe}:{rate}"));
                 shares.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}",
                     percent(now.sleep_ticks.saturating_sub(before.sleep_ticks)),
                     percent(now.spin_ticks.saturating_sub(before.spin_ticks)),
                     percent(now.sync_ticks.saturating_sub(before.sync_ticks)),
                     now.waits.saturating_sub(before.waits),
                     now.compiled.saturating_sub(before.compiled),
                     now.shared.saturating_sub(before.shared),
+                    percent(now.halt_ticks.saturating_sub(before.halt_ticks)),
+                    now.short_waits.saturating_sub(before.short_waits),
                 ));
                 fetches.push_str(&format!(
                     " {pe}:{}/{}/{}/{}",
@@ -1333,6 +1350,7 @@ impl Heartbeat {
                 );
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                pac_fills += now.pac_fills.saturating_sub(before.pac_fills);
                 deltas(
                     &mut store,
                     pe,
@@ -1341,7 +1359,7 @@ impl Heartbeat {
                 );
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     cause.installs.saturating_sub(was.installs),
                     cause.thrash.saturating_sub(was.thrash),
                     cause.elsewhere.saturating_sub(was.elsewhere),
@@ -1349,6 +1367,13 @@ impl Heartbeat {
                     cause.installed_bytes.saturating_sub(was.installed_bytes) / 1024,
                     cause.evicted_bytes.saturating_sub(was.evicted_bytes) / 1024,
                     percent(cause.evict_ticks.saturating_sub(was.evict_ticks)),
+                    cause
+                        .guest_instructions
+                        .saturating_sub(was.guest_instructions),
+                    cause.upper_bytes.saturating_sub(was.upper_bytes) / 1024,
+                    cause
+                        .upper_instructions
+                        .saturating_sub(was.upper_instructions),
                 ));
                 phases.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.phases.iter().zip(before.phases).enumerate() {
@@ -1450,20 +1475,19 @@ impl Heartbeat {
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
             output::arguments(format_args!("{transitions}\n"));
-            let [genter, gexit] =
-                [&transition_misses[..8], &transition_misses[8..]].map(|misses| {
-                    misses
-                        .iter()
-                        .map(|count| format!("{count}"))
-                        .collect::<Vec<_>>()
-                        .join("/")
-                });
+            let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
+                transition_misses[kind * 8..kind * 8 + 8]
+                    .iter()
+                    .map(|count| format!("{count}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            });
             output::arguments(format_args!(
-                "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other genter={genter} gexit={gexit}\n"
+                "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other svc={svc} eret={eret} genter={genter} gexit={gexit}\n"
             ));
             output::arguments(format_args!("{store}\n"));
             stamped.push_str(&format!(" in_use={stamped_in_use}"));
-            stamped_line = Some((stamped, predicted));
+            stamped_line = Some((stamped, predicted, pac_fills));
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{phases}\n"));
                 output::arguments(format_args!("{levels}\n"));
@@ -1500,12 +1524,14 @@ impl Heartbeat {
                 self.beats.is_multiple_of(HOT_TOTAL_BEATS),
             );
         }
-        if let Some((mut line, predicted)) = stamped_line {
+        if let Some((mut line, predicted, pac_fills)) = stamped_line {
             if machine.step_timing().is_some() {
                 line.push_str(&dynamic_sites(&self.dynamic));
             }
             // Exits of PAC branch thunks given a predicted tail this beat.
             line.push_str(&format!(" predicted={predicted}"));
+            // PAC results computed this beat, all PEs: memo misses.
+            line.push_str(&format!(" pac_fills={pac_fills}"));
             output::arguments(format_args!("{line}\n"));
         }
         // Self-loops since boot, every PE together: compiled, then with
@@ -1569,11 +1595,13 @@ fn board_code(
     // with its ring part, an IC IVAU, a part taken for want of a slot or
     // anything else; IC IVAU ones of unchanged bytes; again within one
     // turn of the ring, four, or later; at a frame offset that held a
-    // block of another PC, or of the same PC in another variant.
+    // block of another PC, or of the same PC in another variant; ghosts
+    // that took another block's ghost slot (re-installs seen as new).
     let churn = now.churn.since(&was.churn);
     let churn = format!(
         " churn=new/ring/ivau/slot/other:{}/{}/{}/{}/{} same_bytes={} \
-         ages=turn/four/older:{}/{}/{} aliases=pc/variant:{}/{}",
+         ages=turn/four/older:{}/{}/{} aliases=pc/variant:{}/{} ghosts_overwritten={} \
+         rebased=hits/proven/unprovable/kib:{}/{}/{}/{}",
         churn.new,
         churn.again[0],
         churn.again[1],
@@ -1585,6 +1613,13 @@ fn board_code(
         churn.ages[2],
         churn.aliases,
         churn.variants,
+        churn.overwritten,
+        now.rebases.hits.saturating_sub(was.rebases.hits),
+        now.rebases.proven.saturating_sub(was.rebases.proven),
+        now.rebases
+            .unprovable
+            .saturating_sub(was.rebases.unprovable),
+        now.rebases.bytes / 1024,
     );
     // The parts young and tenured code hold, installs sent to the tenured
     // generation, and parts taken away: the oldest young one, the tenured
@@ -1668,6 +1703,7 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
     ));
     output::arguments(format_args!("{line}\n"));
     owner_report(heap.live);
+    super::large_blocks::report();
 }
 
 /// `HEAP OWNERS linux=40/52M libc=900/1350M rest=600M`: the heap bytes
@@ -1723,7 +1759,7 @@ pub(super) fn beat_report<H: Host>(
          compiled={} discards={}{} evictions={} unlinks={} chained={}% exceptions={} interrupts={} \
          waits={} \
          heap={}M/{}M carved={}M peak={}M largest={}M extents={} carves={} \
-         shadow_peak={}M/{}M/{}M exhausted={} code_peak={}M/{}M\n",
+         shadow_peak={}M/{}M/{}M/{}M exhausted={} code_peak={}M/{}M\n",
         next.blocks,
         cpu.pc,
         level_name(cpu.pstate.guarded),
@@ -1749,7 +1785,8 @@ pub(super) fn beat_report<H: Host>(
         heap.carves,
         shadow.shadow_peak[0] >> 20,
         shadow.shadow_peak[1] >> 20,
-        shadow.shadow_bytes >> 20,
+        shadow.shadow_bytes[0] >> 20,
+        shadow.shadow_bytes[1] >> 20,
         shadow.exhausted,
         shadow.code_peak >> 20,
         shadow.code_bytes >> 20,

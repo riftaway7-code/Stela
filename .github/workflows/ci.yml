@@ -1,6 +1,7 @@
-# Format, lint and unit tests of the stela command on Linux and Windows.
-# Neither needs a built stela.efi: build.rs only embeds one when STELA_EFI
-# names it, so this stays far cheaper than the release workflow.
+# What a push to main or a pull request must pass: the format of every crate,
+# and the lint and unit tests of the stela command on Linux, Windows and macOS.
+# None needs a built stela.efi: build.rs only embeds one when STELA_EFI names
+# it, so this stays far cheaper than the release workflow.
 name: ci
 
 on:
@@ -14,7 +15,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Every commit on main keeps its result; a pull request keeps its newest.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -25,17 +27,47 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  cli:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # No later step pushes, and a pull request's code runs here.
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Format
+        run: |
+          # Every crate, as cargo xtask check formats them.
+          cargo fmt --all -- --check
+          for crate in crates/stela-boot crates/stela-mesa crates/stela-mesa/std; do
+            cargo fmt --manifest-path "$crate/Cargo.toml" -- --check
+          done
+
+  check:
+    name: check (${{ matrix.system }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-          - os: windows-2025
+          - system: linux
+            os: ubuntu-22.04
+          - system: windows
+            os: windows-2025
+          - system: macos
+            os: macos-26
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          # No later step pushes, and a pull request's code runs here.
+          persist-credentials: false
 
       - name: Put LLVM on PATH
         run: |
@@ -63,9 +95,6 @@ jobs:
           rustup toolchain install
           rustc --version
           clang --version | head -1
-
-      - name: Format
-        run: cargo fmt -p stela-cli -- --check
 
       - name: Clippy
         run: cargo clippy --locked -p stela-cli --all-targets -- -D warnings

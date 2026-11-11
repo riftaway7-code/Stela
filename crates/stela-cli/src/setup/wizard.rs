@@ -317,7 +317,7 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         // What the install needs the network for, and what is not known
         // about the installed system's first start.
         let full = install_image == InstallImage::Full;
-        for note in super::create::network_notes(!full, full) {
+        for note in super::create::expected_network_notes(full) {
             cliclack::log::info(note)?;
         }
         choose_wifi(command)?;
@@ -331,7 +331,10 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                     |serial| format!("{} · serial {serial}", usb.description())
                 ),
                 match full {
-                    true => "Full · macOS goes on the USB, the install needs no network",
+                    true => {
+                        "Full · macOS goes on the USB; the install needs a network only if \
+                         Apple's signing answers do not fit it"
+                    }
                     false => "Network · macOS downloads during installation",
                 },
                 command.build,
