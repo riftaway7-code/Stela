@@ -104,9 +104,9 @@ use uninstall::uninstall;
 
 /// `relative`, spelled with `/`, below `base` with the host's own separators.
 fn join_slashed(base: &Path, relative: &str) -> PathBuf {
-    relative
-        .split('/')
-        .fold(base.to_path_buf(), |path, part| path.join(part))
+    let mut path = base.to_path_buf();
+    path.extend(relative.split('/'));
+    path
 }
 
 /// The Mac models setup presents, with their names: the M2 Mac mini, the

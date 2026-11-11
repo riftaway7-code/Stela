@@ -2846,10 +2846,6 @@ fn installed_os_update_preserves_user_data() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "setup and repair spell stela/boot with different separators, and this compares their records byte for byte"
-)]
 fn repair_restores_recorded_state() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
@@ -2931,6 +2927,28 @@ fn repair_restores_recorded_state() {
 }
 
 #[test]
+fn a_record_spells_a_path_one_way_however_it_was_built() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    let path = f.esp.join(RECORD);
+    let written = fs::read(&path).unwrap();
+    // The same directory with the separator this system does not write, as
+    // joining `stela/boot` whole leaves it on Windows.
+    let mut made = record(&f);
+    let (own, other) = match std::path::MAIN_SEPARATOR {
+        '/' => ("/", "\\"),
+        _ => ("\\", "/"),
+    };
+    let below = made.bundle_directory.strip_prefix(&made.volume).unwrap();
+    let below = below.to_str().unwrap().replace(own, other);
+    assert!(below.contains(other), "{below}");
+    made.bundle_directory = format!("{}{other}{below}", made.volume.display()).into();
+    write_record(&f.esp, &made).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), written);
+}
+
+#[test]
 fn maintenance_writes_only_machine_state() {
     let mut f = fixture(64 * GIB, false);
     // An installed macOS: the Apple region holds the guest's own GPT,
@@ -3001,10 +3019,6 @@ fn maintenance_writes_only_machine_state() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "setup and repair spell stela/boot with different separators, and this compares their records byte for byte"
-)]
 fn repair_recovers_interrupted_bundle_rename() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
