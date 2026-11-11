@@ -7,6 +7,35 @@ use stela_soc_data::nor::nvram::Variables;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+fn sparse_image(path: &Path, bytes: u64) {
+    let file = fs::File::create(path).unwrap();
+    #[cfg(windows)]
+    mark_sparse(&file);
+    file.set_len(bytes).unwrap();
+}
+
+#[cfg(windows)]
+fn mark_sparse(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_SPARSE};
+    let mut returned = 0u32;
+    // SAFETY: the handle is open for the file's lifetime, the control code
+    // takes no buffers, and `returned` outlives the call.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(ok != 0, "cannot mark the image sparse");
+}
+
 #[test]
 fn partitions_are_named_alone_or_by_device_path() {
     use clap::Parser as _;
@@ -970,7 +999,7 @@ fn add_stick_ssd(f: &mut Fixture, identifier: &str, guid: &str) {
     });
     // Sparse, as large as the partition: the machine state is its tail.
     let path = f._dir.path().join(format!("{identifier}.img"));
-    fs::File::create(&path).unwrap().set_len(100 * GIB).unwrap();
+    sparse_image(&path, 100 * GIB);
     let info = PartitionInfo {
         identifier: identifier.into(),
         disk: "disk5".into(),
@@ -3183,9 +3212,7 @@ fn add_split_disk(f: &mut Fixture, second: bool, head: &[u8]) {
         ("disk1", SERIAL, REGION, REGION_GUID)
     };
     let path = f._dir.path().join(format!("{identifier}.img"));
-    let file = fs::File::create(&path).unwrap();
-    file.set_len(SPLIT_BYTES).unwrap();
-    drop(file);
+    sparse_image(&path, SPLIT_BYTES);
     let info = PartitionInfo {
         identifier: identifier.into(),
         disk: disk.into(),

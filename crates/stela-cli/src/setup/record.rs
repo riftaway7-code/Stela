@@ -646,10 +646,13 @@ mod rebase_tests {
         assert_eq!(value["esp"], "/media/user/EFI");
         assert_eq!(value["volume"], "/media/user/STELA1");
         assert_eq!(
-            value["bundle_directory"],
-            "/media/user/STELA1/stela/boot/27A1"
+            Path::new(value["bundle_directory"].as_str().unwrap()),
+            Path::new("/media/user/STELA1/stela/boot/27A1")
         );
-        assert_eq!(value["created_directories"][0], "/media/user/STELA1/stela");
+        assert_eq!(
+            Path::new(value["created_directories"][0].as_str().unwrap()),
+            Path::new("/media/user/STELA1/stela")
+        );
         // Another path that only starts alike, and the boot options, stay.
         assert_eq!(value["created_directories"][1], "/run/media/root/STELATE");
         assert_eq!(
@@ -678,6 +681,9 @@ mod rebase_tests {
         });
         rebase(&mut value, Path::new("/b"), Path::new("/b"));
         assert_eq!(value["volume"], "/b");
-        assert_eq!(value["bundle_directory"], "/b/stela/boot/27A1");
+        assert_eq!(
+            Path::new(value["bundle_directory"].as_str().unwrap()),
+            Path::new("/b/stela/boot/27A1")
+        );
     }
 }
